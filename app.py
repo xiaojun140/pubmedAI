@@ -620,6 +620,7 @@ def build_ai_context(df: pd.DataFrame, max_chars: int = 28000) -> str:
 def build_review_prompts(topic_hint: str, df: pd.DataFrame, user_extra: str = ""):
     context = build_ai_context(df)
 
+    # ===== System Prompt =====
     system_default = (
         "你是一名严谨的医学/生命科学综述写作助手。"
         "你必须只依据用户提供的参考文献信息（题目与摘要）进行归纳，避免臆测。"
@@ -630,30 +631,37 @@ def build_review_prompts(topic_hint: str, df: pd.DataFrame, user_extra: str = ""
         "不要输出参考文献列表（用户将用 EndNote 处理）。"
     )
 
+    # ===== 处理主题 =====
+    topic_value = topic_hint.strip() or "由文献内容自动归纳主题"
+
+    # ===== 默认写作要求 =====
+    default_requirement = (
+        "1 建议结构：背景与问题  关键机制或证据  临床、应用或研究进展 局限性 未来方向\n"
+        "2 尽量做到归纳对比，避免逐篇复述。\n"
+        "3 任何一句话都必须在句末标注 PMID。\n"
+        "4 禁止编造，若文献中无信息支撑，请使用谨慎表达，并仍标注来源 PMID。\n"
+        "5 篇幅：约 800~1500 字，可根据文献数量适当调整。"
+    )
+
+    # ===== 如果用户填写了自定义要求，则覆盖默认 =====
+    extra_requirement = user_extra.strip() or default_requirement
+
+    # ===== User Prompt =====
     user_prompt = f"""
 请基于下面提供的文献题目与摘要，围绕主题生成一篇结构清晰的综述。
 
-【主题/方向】{topic_hint.strip() if topic_hint.strip() else "由文献内容自动归纳主题"}
+【主题/方向】
+{topic_value}
 
-extra_requirement = user_extra.strip() if user_extra.strip() else (
-    "1 建议结构：背景与问题  关键机制或证据  临床、应用或研究进展 局限性 未来方向 \n"
-    "2 尽量做到归纳对比，避免逐篇复述。\n"
-    "3 任何一句话都必须在句末标注 PMID（只标 PMID）。\n"
-    "4 禁止编造，若文献中无信息支撑，就用谨慎表达，并仍标注来源 PMID。\n"
-    "5 篇幅：约 800~1500 字，可根据文献数量适当调整。"
-)
-
-【写作要求】{extra_requirement}
-
-
-【额外要求（可为空）】
-{user_extra.strip() if user_extra.strip() else "无"}
+【写作要求】
+{extra_requirement}
 
 【文献数据】
 {context}
 """.strip()
 
     return system_default, user_prompt
+
 
 
 # ===============================
@@ -986,7 +994,7 @@ elif page == "🤖 AI 综述生成":
 
     st.markdown("### 2) 综述参数")
     topic_hint = st.text_input("综述主题提示（可选，不填则自动归纳）", value="")
-    user_extra = st.text_area("额外要求（可选）", value="例如：更偏机制综述；按时间线总结；突出临床试验证据等", height=90)
+    user_extra = st.text_area("写作要求（必田）", value="例如：更偏机制综述；按时间线总结；突出临床试验证据等", height=90)
 
     st.markdown("### 3) 生成综述（自动保存到本地数据库）")
     if st.button("🚀 开始生成"):
@@ -1189,6 +1197,7 @@ else:
                 with col_h2:
                     if st.button("⬇ 下载该条 MD"):
                         trigger_frontend_download(f"pubmed_strategy_{sel_id}.md", "text/markdown", (item["assistant_output"] or "").encode("utf-8-sig"))
+
 
 
 
