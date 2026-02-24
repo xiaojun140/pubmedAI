@@ -994,7 +994,7 @@ elif page == "🤖 AI 综述生成":
 
     st.markdown("### 2) 综述参数")
     topic_hint = st.text_input("综述主题提示（可选，不填则自动归纳）", value="")
-    user_extra = st.text_area("写作要求（必田）", value="例如：更偏机制综述；按时间线总结；突出临床试验证据等", height=90)
+    user_extra = st.text_area("写作要求（可选）", value="可选，不填则自动按内置指令生成", height=90)
 
     st.markdown("### 3) 生成综述（自动保存到本地数据库）")
     if st.button("🚀 开始生成"):
@@ -1197,6 +1197,7 @@ else:
                 with col_h2:
                     if st.button("⬇ 下载该条 MD"):
                         trigger_frontend_download(f"pubmed_strategy_{sel_id}.md", "text/markdown", (item["assistant_output"] or "").encode("utf-8-sig"))
+
 
 
 
