@@ -636,7 +636,14 @@ def build_review_prompts(topic_hint: str, df: pd.DataFrame, user_extra: str = ""
 【主题/方向】{topic_hint.strip() if topic_hint.strip() else "由文献内容自动归纳主题"}
 
 【写作要求】
-{user_extra.strip() if user_extra.strip() else "1) 建议结构：背景与问题 -> 关键机制/证据 -> 临床/应用或研究进展 -> 局限性 -> 未来方向。\\n2) 尽量做到归纳对比，避免逐篇复述。\\n3) 任何一句话都必须在句末标注 PMID（只标 PMID）。\\n4) 禁止编造：若文献中无信息支撑，就用谨慎表达，并仍标注来源 PMID。\\n5) 篇幅：约 800~1500 字（可根据文献数量适当调整）。"}
+default_extra = """1) 建议结构：背景与问题 -> 关键机制/证据 -> 临床/应用或研究进展 -> 局限性 -> 未来方向。
+2) 尽量做到归纳对比，避免逐篇复述。
+3) 任何一句话都必须在句末标注 PMID（只标 PMID）。
+4) 禁止编造：若文献中无信息支撑，就用谨慎表达，并仍标注来源 PMID。
+5) 篇幅：约 800~1500 字（可根据文献数量适当调整）。"""
+
+extra_requirement = user_extra.strip() if user_extra.strip() else default_extra
+
 
 【额外要求（可为空）】
 {user_extra.strip() if user_extra.strip() else "无"}
@@ -1181,5 +1188,6 @@ else:
                 with col_h2:
                     if st.button("⬇ 下载该条 MD"):
                         trigger_frontend_download(f"pubmed_strategy_{sel_id}.md", "text/markdown", (item["assistant_output"] or "").encode("utf-8-sig"))
+
 
 
