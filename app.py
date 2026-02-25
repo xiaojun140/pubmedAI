@@ -1006,7 +1006,7 @@ if "chat_last_output" not in st.session_state:
 
 
 # 页面导航（新增：💬 AI 对话）
-page = st.sidebar.radio("📄 页面", ["🔍 文献检索", "📌 我的收藏", "🤖 AI 综述生成", "💬 AI 对话：PubMed检索策略"])
+page = st.sidebar.radio("📄 页面", ["💬 检索策略生成", "🔍 文献检索", "📌 我的收藏", "🤖 AI 综述生成"])
 
 
 def add_selected(pmid):
