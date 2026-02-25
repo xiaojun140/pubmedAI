@@ -286,44 +286,38 @@ def init_db():
 
 def migrate_legacy_to_multiuser():
     """
-    If the DB was created by your old version, attempt to migrate data.
-    This function is idempotent-ish and best-effort.
+    Best-effort migration from legacy single-user schema to multi-user.
+    IMPORTANT: Do NOT early-return just because one table is already migrated.
     """
     with _DB_LOCK:
         conn = db_connect()
         try:
             c = conn.cursor()
 
-            # detect legacy favorites schema: (pmid TEXT PRIMARY KEY)
+            # -------- favorites --------
             c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='favorites'")
-            if not c.fetchone():
-                return
+            if c.fetchone():
+                c.execute("PRAGMA table_info(favorites)")
+                fav_cols = [r[1] for r in c.fetchall()]
+                if "user_id" not in fav_cols:
+                    c.execute("ALTER TABLE favorites RENAME TO favorites_legacy")
+                    c.execute("""
+                        CREATE TABLE IF NOT EXISTS favorites (
+                            user_id TEXT,
+                            pmid TEXT,
+                            PRIMARY KEY (user_id, pmid),
+                            FOREIGN KEY (pmid) REFERENCES articles(pmid)
+                        )
+                    """)
+                    c.execute("INSERT OR IGNORE INTO favorites(user_id, pmid) SELECT 'default', pmid FROM favorites_legacy")
+                    c.execute("DROP TABLE favorites_legacy")
 
-            # Check if favorites has user_id column; if not, it is legacy
-            c.execute("PRAGMA table_info(favorites)")
-            cols = [r[1] for r in c.fetchall()]
-            if "user_id" in cols:
-                return  # already new
-
-            # Legacy detected. Rename and rebuild.
-            c.execute("ALTER TABLE favorites RENAME TO favorites_legacy")
-            c.execute("""
-                CREATE TABLE IF NOT EXISTS favorites (
-                    user_id TEXT,
-                    pmid TEXT,
-                    PRIMARY KEY (user_id, pmid),
-                    FOREIGN KEY (pmid) REFERENCES articles(pmid)
-                )
-            """)
-            c.execute("INSERT OR IGNORE INTO favorites(user_id, pmid) SELECT 'default', pmid FROM favorites_legacy")
-            c.execute("DROP TABLE favorites_legacy")
-
-            # search_cache legacy?
+            # -------- search_cache --------
             c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='search_cache'")
             if c.fetchone():
                 c.execute("PRAGMA table_info(search_cache)")
-                cols2 = [r[1] for r in c.fetchall()]
-                if "user_id" not in cols2:
+                sc_cols = [r[1] for r in c.fetchall()]
+                if "user_id" not in sc_cols:
                     c.execute("ALTER TABLE search_cache RENAME TO search_cache_legacy")
                     c.execute("""
                         CREATE TABLE IF NOT EXISTS search_cache (
@@ -335,20 +329,35 @@ def migrate_legacy_to_multiuser():
                             FOREIGN KEY (pmid) REFERENCES articles(pmid)
                         )
                     """)
-                    c.execute("""
-                        INSERT OR IGNORE INTO search_cache(user_id, idx, pmid)
-                        SELECT 'default', idx, pmid FROM search_cache_legacy
-                    """)
+                    # old schema might be (idx, pmid)
+                    # copy as default user
+                    try:
+                        c.execute("""
+                            INSERT OR IGNORE INTO search_cache(user_id, idx, pmid)
+                            SELECT 'default', idx, pmid FROM search_cache_legacy
+                        """)
+                    except Exception:
+                        # if legacy table doesn't have idx, fall back to rowid ordering
+                        c.execute("""
+                            INSERT OR IGNORE INTO search_cache(user_id, idx, pmid)
+                            SELECT 'default', (rowid-1) as idx, pmid FROM search_cache_legacy
+                        """)
                     c.execute("DROP TABLE search_cache_legacy")
 
-            # ai_settings legacy? (single row id=1)
+            # -------- ai_settings --------
             c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='ai_settings'")
             if c.fetchone():
                 c.execute("PRAGMA table_info(ai_settings)")
-                cols3 = [r[1] for r in c.fetchall()]
-                if "user_id" not in cols3 and "id" in cols3:
-                    # legacy table: id=1 row
-                    row = conn.execute("SELECT base_url, api_key, model, temperature, max_tokens, system_prompt FROM ai_settings WHERE id=1").fetchone()
+                ai_cols = [r[1] for r in c.fetchall()]
+                # legacy had "id" and "api_key", new has "user_id" and "api_key_enc"
+                if "user_id" not in ai_cols:
+                    row = None
+                    if "id" in ai_cols:
+                        row = conn.execute("""
+                            SELECT base_url, api_key, model, temperature, max_tokens, system_prompt
+                            FROM ai_settings WHERE id=1
+                        """).fetchone()
+
                     c.execute("ALTER TABLE ai_settings RENAME TO ai_settings_legacy")
                     c.execute("""
                         CREATE TABLE IF NOT EXISTS ai_settings (
@@ -367,10 +376,15 @@ def migrate_legacy_to_multiuser():
                         c.execute("""
                             INSERT OR REPLACE INTO ai_settings(user_id, base_url, api_key_enc, model, temperature, max_tokens, system_prompt)
                             VALUES (?, ?, ?, ?, ?, ?, ?)
-                        """, ("default", base_url or "https://api.openai.com/v1", api_key_enc, model or "gpt-4o-mini",
-                              float(temperature) if temperature is not None else 0.3,
-                              int(max_tokens) if max_tokens is not None else 1500,
-                              system_prompt or ""))
+                        """, (
+                            "default",
+                            (base_url or "https://api.openai.com/v1").rstrip("/"),
+                            api_key_enc,
+                            model or "gpt-4o-mini",
+                            float(temperature) if temperature is not None else 0.3,
+                            int(max_tokens) if max_tokens is not None else 1500,
+                            system_prompt or ""
+                        ))
                     c.execute("DROP TABLE ai_settings_legacy")
 
             conn.commit()
@@ -461,16 +475,34 @@ def save_ai_settings(user_id: str, base_url, api_key, model, temperature, max_to
 # Articles / Favorites / Search cache (per user)
 # ======================================================
 def clear_search_cache(user_id: str):
-    with _DB_LOCK:
-        conn = db_connect()
+    """
+    Clear per-user cache. If DB is in legacy schema (missing user_id column),
+    run migration and retry once.
+    """
+    try:
+        with _DB_LOCK:
+            conn = db_connect()
+            try:
+                c = conn.cursor()
+                c.execute("DELETE FROM search_cache WHERE user_id=?", (user_id,))
+                conn.commit()
+            finally:
+                conn.close()
+    except sqlite3.OperationalError:
+        # likely "no such column: user_id" due to legacy table
         try:
-            c = conn.cursor()
-            # delete cached-only articles not favorited by this user AND not favorited by anyone? safer: keep global articles.
-            # We'll only clear search_cache rows; do not delete articles table rows (shared).
-            c.execute("DELETE FROM search_cache WHERE user_id=?", (user_id,))
-            conn.commit()
-        finally:
-            conn.close()
+            migrate_legacy_to_multiuser()
+        except Exception:
+            pass
+        # retry once
+        with _DB_LOCK:
+            conn = db_connect()
+            try:
+                c = conn.cursor()
+                c.execute("DELETE FROM search_cache WHERE user_id=?", (user_id,))
+                conn.commit()
+            finally:
+                conn.close()
 
 
 def save_search_results_to_db(user_id: str, articles: list[dict]):
@@ -1772,3 +1804,4 @@ else:
                 with col_h2:
                     if st.button("⬇ 下载该条 MD"):
                         trigger_frontend_download(f"pubmed_strategy_{sel_id}.md", "text/markdown", (item["assistant_output"] or "").encode("utf-8-sig"))
+
