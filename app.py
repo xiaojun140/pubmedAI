@@ -288,9 +288,6 @@ def save_ai_review_to_db(source, pmids, topic_hint, base_url, model, temperature
         user_prompt,
         output
     ))
-
-    new_id = c.lastrowid  # 取回自增 id（用于“改写链路”追踪）
-
     # Ensure ai_settings schema is compatible with this app
     try:
         migrate_ai_settings_schema(conn)
@@ -299,7 +296,6 @@ def save_ai_review_to_db(source, pmids, topic_hint, base_url, model, temperature
 
     conn.commit()
     conn.close()
-    return new_id
 
 
 def list_ai_reviews(limit=50):
@@ -325,6 +321,45 @@ def load_ai_review(review_id: int):
     if df.empty:
         return None
     return df.iloc[0].to_dict()
+
+
+def clear_ai_reviews():
+    """Delete all AI review history records."""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("DELETE FROM ai_reviews")
+    conn.commit()
+    conn.close()
+
+
+def clear_chat_logs(chat_type: str | None = None):
+    """Delete AI chat logs. If chat_type provided, only delete that type."""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    if chat_type:
+        c.execute("DELETE FROM ai_chat_logs WHERE chat_type = ?", (chat_type,))
+    else:
+        c.execute("DELETE FROM ai_chat_logs")
+    conn.commit()
+    conn.close()
+
+
+def delete_ai_review(review_id: int):
+    """Delete a single AI review record by id."""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("DELETE FROM ai_reviews WHERE id = ?", (int(review_id),))
+    conn.commit()
+    conn.close()
+
+
+def delete_chat_log(chat_id: int):
+    """Delete a single AI chat log record by id."""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("DELETE FROM ai_chat_logs WHERE id = ?", (int(chat_id),))
+    conn.commit()
+    conn.close()
 
 
 # ===============================
@@ -385,22 +420,6 @@ def load_chat_log(chat_id: int):
         return None
     return df.iloc[0].to_dict()
 
-def clear_ai_reviews():
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("DELETE FROM ai_reviews")
-    conn.commit()
-    conn.close()
-
-def clear_chat_logs(chat_type: str = None):
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    if chat_type:
-        c.execute("DELETE FROM ai_chat_logs WHERE chat_type = ?", (chat_type,))
-    else:
-        c.execute("DELETE FROM ai_chat_logs")
-    conn.commit()
-    conn.close()
 
 # ===============================
 # 搜索缓存：启动清空（不删除收藏）
@@ -957,41 +976,6 @@ def build_review_prompts(topic_hint: str, df: pd.DataFrame, user_extra: str = ""
     return system_default, user_prompt
 
 
-def build_review_revision_prompts(instruction: str, original_review: str, df: pd.DataFrame, topic_hint: str = ""):
-    """基于“原综述 + 文献上下文 + 修改指令”生成改写版综述的 prompts。"""
-    context = build_ai_context(df)
-
-    system_default = (
-        "你是一名严谨的医学/生命科学综述写作助手。"
-        "你将收到：1) 原综述 2) 修改指令 3) 文献题目与摘要。"
-        "你必须只依据文献题目与摘要修改原综述，避免臆测。"
-        "输出为中文。"
-        "非常重要：每一句话末尾必须用括号标注 PMID 作为来源，格式严格为 (PMID:12345678) 或 (PMID:123; PMID:456)。"
-        "不要在句中插入 PMID，只能句末标注。"
-        "不得编造新的 PMID；如需新增表述，必须能从给定文献中找到依据并标注相应 PMID。"
-        "不要输出参考文献列表。"
-    )
-
-    topic_value = topic_hint.strip() or "沿用原综述主题"
-
-    user_prompt = f"""
-请按“修改指令”对“原综述”进行改写，输出一份“修改后的完整综述”（不是修改建议、不是对比清单）。
-
-【主题/方向】
-{topic_value}
-
-【修改指令】
-{instruction.strip()}
-
-【原综述】
-{original_review.strip()}
-
-【文献数据（仅允许依据这些内容）】
-{context}
-""".strip()
-
-    return system_default, user_prompt
-
 
 # ===============================
 # AI：PubMed 检索策略 prompt 构建
@@ -1054,8 +1038,6 @@ if "fav_export_request" not in st.session_state:
     st.session_state["fav_export_request"] = None
 if "ai_last_output" not in st.session_state:
     st.session_state["ai_last_output"] = ""
-if "ai_last_review_id" not in st.session_state:
-    st.session_state["ai_last_review_id"] = None
 if "ai_notice" not in st.session_state:
     st.session_state["ai_notice"] = None
 if "chat_last_output" not in st.session_state:
@@ -1412,7 +1394,7 @@ elif page == "🤖 AI 综述生成":
                         )
                     st.session_state["ai_last_output"] = output
 
-                    new_id = save_ai_review_to_db(
+                    save_ai_review_to_db(
                         source=",".join(source_tag) if source_tag else "none",
                         pmids=",".join([str(p) for p in pmids_unique]),
                         topic_hint=topic_hint,
@@ -1424,7 +1406,6 @@ elif page == "🤖 AI 综述生成":
                         user_prompt=user_prompt,
                         output=output
                     )
-                    st.session_state["ai_last_review_id"] = new_id
                     st.success("生成完成，并已保存到本地数据库（ai_reviews）")
                 except Exception as e:
                     st.session_state["ai_notice"] = f"AI 调用失败：{e}"
@@ -1442,77 +1423,9 @@ elif page == "🤖 AI 综述生成":
         with col_d2:
             if st.button("⬇ 纯前端下载 MD"):
                 trigger_frontend_download("ai_review.md", "text/markdown", st.session_state["ai_last_output"].encode("utf-8-sig"))
-
-        st.markdown("### 4.1) 根据口令修改本次综述（迭代改写）")
-        revise_cmd = st.text_area(
-            "修改口令/指令（例如：压缩到600字；增加局限性段；把结构改为IMRAD；突出临床证据；语气更学术等）",
-            value="",
-            height=110,
-            key="review_revision_cmd"
-        )
-
-        if st.button("✍️ 按口令改写综述", key="btn_revision"):
-            if not st.session_state.get("ai_last_output", "").strip():
-                st.session_state["ai_notice"] = "当前没有可改写的综述，请先生成综述。"
-            elif not revise_cmd.strip():
-                st.session_state["ai_notice"] = "请输入修改口令后再改写。"
-            else:
-                cfg = load_ai_settings()
-                base_url = cfg["base_url"].rstrip("/")
-                api_key = cfg["api_key"]
-                model = cfg["model"]
-                temperature = cfg["temperature"]
-                max_tokens = cfg["max_tokens"]
-                system_prompt_custom = cfg["system_prompt"]
-
-                if df_input.empty:
-                    st.session_state["ai_notice"] = "输入文献为空，无法进行基于文献的改写。"
-                else:
-                    sys_default, user_prompt2 = build_review_revision_prompts(
-                        instruction=revise_cmd,
-                        original_review=st.session_state["ai_last_output"],
-                        df=df_input,
-                        topic_hint=topic_hint
-                    )
-                    system_prompt2 = sys_default + ("\n\n" + system_prompt_custom.strip() if system_prompt_custom.strip() else "")
-
-                    try:
-                        with st.spinner("AI 正在按口令改写综述..."):
-                            revised = call_chat_completions(
-                                base_url=base_url,
-                                api_key=api_key,
-                                model=model,
-                                temperature=temperature,
-                                max_tokens=max_tokens,
-                                system_prompt=system_prompt2,
-                                user_prompt=user_prompt2
-                            )
-
-                        st.session_state["ai_last_output"] = revised
-
-                        parent_id = st.session_state.get("ai_last_review_id")
-                        src = f"revision_of:{parent_id}" if parent_id else "revision"
-
-                        new_id2 = save_ai_review_to_db(
-                            source=src,
-                            pmids=",".join([str(p) for p in pmids_unique]),
-                            topic_hint=topic_hint,
-                            base_url=base_url,
-                            model=model,
-                            temperature=temperature,
-                            max_tokens=max_tokens,
-                            system_prompt=system_prompt2,
-                            user_prompt=user_prompt2,
-                            output=revised
-                        )
-                        st.session_state["ai_last_review_id"] = new_id2
-
-                        st.success("已按口令改写，并保存为一条新的历史综述记录。")
-                        st.rerun()
-                    except Exception as e:
-                        st.session_state["ai_notice"] = f"AI 改写失败：{e}"
     else:
         st.info("暂无结果。点击上方“开始生成”。")
+
     st.markdown("### 5) 历史综述（来自本地数据库）")
 
     col_hclr, _ = st.columns([1, 4])
@@ -1520,19 +1433,20 @@ elif page == "🤖 AI 综述生成":
         st.session_state["confirm_clear_ai_reviews"] = True
 
     if st.session_state.get("confirm_clear_ai_reviews"):
-        @st.dialog("确认清空？")
+        @st.dialog("确认清空AI综述历史？")
         def _confirm_clear_reviews():
             st.warning("将删除所有 AI 综述历史记录（ai_reviews），且不可恢复。")
             c1, c2 = st.columns(2)
             if c1.button("确认删除", key="confirm_clear_ai_reviews_yes"):
                 clear_ai_reviews()
+                st.session_state["ai_last_output"] = ""
+                st.session_state["ai_last_review_id"] = None
                 st.session_state["confirm_clear_ai_reviews"] = False
                 st.rerun()
             if c2.button("取消", key="confirm_clear_ai_reviews_no"):
                 st.session_state["confirm_clear_ai_reviews"] = False
                 st.rerun()
         _confirm_clear_reviews()
-
     hist = list_ai_reviews(limit=50)
     if hist.empty:
         st.write("暂无历史记录。")
@@ -1548,12 +1462,34 @@ elif page == "🤖 AI 综述生成":
                 st.write(f"文献 PMID：{(item['pmids'] or '')[:200]}{'...' if item.get('pmids') and len(item['pmids'])>200 else ''}")
                 st.write(f"模型：{item['model']} | temp={item['temperature']} | max_tokens={item['max_tokens']}")
                 st.text_area("输出", item["output"] or "", height=320)
-                col_h1, col_h2 = st.columns(2)
+                col_del, col_h1, col_h2 = st.columns([1, 1, 1])
+                with col_del:
+                    if st.button("🗑 删除这条记录", key=f"del_ai_review_{sel_id}"):
+                        st.session_state["confirm_delete_ai_review_id"] = sel_id
+
+                if st.session_state.get("confirm_delete_ai_review_id") == sel_id:
+                    @st.dialog("确认删除该条AI综述记录？")
+                    def _confirm_delete_one_review():
+                        st.warning(f"将删除 AI 综述记录 #{sel_id}，且不可恢复。")
+                        c1, c2 = st.columns(2)
+                        if c1.button("确认删除", key=f"confirm_del_ai_review_yes_{sel_id}"):
+                            delete_ai_review(sel_id)
+                            # 若删除的是当前“最新输出”对应记录，则同时清空当前输出
+                            if st.session_state.get("ai_last_review_id") == sel_id:
+                                st.session_state["ai_last_output"] = ""
+                                st.session_state["ai_last_review_id"] = None
+                            st.session_state["confirm_delete_ai_review_id"] = None
+                            st.rerun()
+                        if c2.button("取消", key=f"confirm_del_ai_review_no_{sel_id}"):
+                            st.session_state["confirm_delete_ai_review_id"] = None
+                            st.rerun()
+                    _confirm_delete_one_review()
+
                 with col_h1:
-                    if st.button("⬇ 下载该条 TXT"):
+                    if st.button("⬇ 下载该条 TXT", key=f"dl_ai_review_txt_{sel_id}"):
                         trigger_frontend_download(f"ai_review_{sel_id}.txt", "text/plain", (item["output"] or "").encode("utf-8-sig"))
                 with col_h2:
-                    if st.button("⬇ 下载该条 MD"):
+                    if st.button("⬇ 下载该条 MD", key=f"dl_ai_review_md_{sel_id}"):
                         trigger_frontend_download(f"ai_review_{sel_id}.md", "text/markdown", (item["output"] or "").encode("utf-8-sig"))
 
 
@@ -1643,26 +1579,27 @@ else:
                 trigger_frontend_download("pubmed_search_strategy.md", "text/markdown", st.session_state["chat_last_output"].encode("utf-8-sig"))
     else:
         st.info("暂无输出。输入描述后点击“生成检索策略”。")
+
     st.markdown("### 历史对话（来自本地数据库）")
-    
+
     col_hclr, _ = st.columns([1, 4])
     if col_hclr.button("🗑 一键清空AI检索策略历史", key="clear_pubmed_strategy_logs_btn"):
         st.session_state["confirm_clear_pubmed_strategy_logs"] = True
 
     if st.session_state.get("confirm_clear_pubmed_strategy_logs"):
-        @st.dialog("确认清空？")
+        @st.dialog("确认清空AI检索策略历史？")
         def _confirm_clear_logs():
             st.warning("将删除所有“检索策略生成”AI历史记录（ai_chat_logs: pubmed_strategy），且不可恢复。")
             c1, c2 = st.columns(2)
             if c1.button("确认删除", key="confirm_clear_pubmed_strategy_logs_yes"):
                 clear_chat_logs("pubmed_strategy")
+                st.session_state["chat_last_output"] = ""
                 st.session_state["confirm_clear_pubmed_strategy_logs"] = False
                 st.rerun()
             if c2.button("取消", key="confirm_clear_pubmed_strategy_logs_no"):
                 st.session_state["confirm_clear_pubmed_strategy_logs"] = False
                 st.rerun()
-    _confirm_clear_logs()
-
+        _confirm_clear_logs()
     hist = list_chat_logs("pubmed_strategy", limit=50)
     if hist.empty:
         st.write("暂无历史记录。")
@@ -1678,10 +1615,39 @@ else:
                 st.text_area("用户输入", item["user_input"] or "", height=140)
                 st.text_area("AI 输出", item["assistant_output"] or "", height=320)
 
-                col_h1, col_h2 = st.columns(2)
+                col_del, col_h1, col_h2 = st.columns([1, 1, 1])
+                with col_del:
+                    if st.button("🗑 删除这条记录", key=f"del_pubmed_strategy_{sel_id}"):
+                        st.session_state["confirm_delete_pubmed_strategy_id"] = sel_id
+
+                if st.session_state.get("confirm_delete_pubmed_strategy_id") == sel_id:
+                    @st.dialog("确认删除该条检索策略记录？")
+                    def _confirm_delete_one_strategy():
+                        st.warning(f"将删除检索策略记录 #{sel_id}，且不可恢复。")
+                        c1, c2 = st.columns(2)
+                        if c1.button("确认删除", key=f"confirm_del_pubmed_strategy_yes_{sel_id}"):
+                            delete_chat_log(sel_id)
+                            # 若当前页面输出来自该条记录，可同时清空
+                            st.session_state["chat_last_output"] = ""
+                            st.session_state["confirm_delete_pubmed_strategy_id"] = None
+                            st.rerun()
+                        if c2.button("取消", key=f"confirm_del_pubmed_strategy_no_{sel_id}"):
+                            st.session_state["confirm_delete_pubmed_strategy_id"] = None
+                            st.rerun()
+                    _confirm_delete_one_strategy()
+
                 with col_h1:
-                    if st.button("⬇ 下载该条 TXT"):
+                    if st.button("⬇ 下载该条 TXT", key=f"dl_pubmed_strategy_txt_{sel_id}"):
                         trigger_frontend_download(f"pubmed_strategy_{sel_id}.txt", "text/plain", (item["assistant_output"] or "").encode("utf-8-sig"))
                 with col_h2:
-                    if st.button("⬇ 下载该条 MD"):
+                    if st.button("⬇ 下载该条 MD", key=f"dl_pubmed_strategy_md_{sel_id}"):
                         trigger_frontend_download(f"pubmed_strategy_{sel_id}.md", "text/markdown", (item["assistant_output"] or "").encode("utf-8-sig"))
+
+
+
+
+
+
+
+
+
