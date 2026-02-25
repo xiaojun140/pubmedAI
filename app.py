@@ -24,14 +24,17 @@ DB_FILE = "articles.db"
 # ========= DB lock (in-process) =========
 _DB_LOCK = threading.RLock()
 
+# ========= Security recovery limits =========
+SEC_MAX_FAILS_STAGE1 = 5
+SEC_MAX_FAILS_STAGE2 = 10
+SEC_LOCK_SECONDS_STAGE1 = 15 * 60   # 15 minutes
+SEC_LOCK_SECONDS_STAGE2 = 60 * 60   # 60 minutes
+
 
 # ======================================================
 # Security: API key encryption (Fernet)
 # ======================================================
 def _get_master_fernet() -> "Fernet":
-    """
-    Use env var APP_MASTER_KEY as Fernet key.
-    """
     if Fernet is None:
         raise RuntimeError("缺少依赖 cryptography。请先安装：pip install cryptography")
 
@@ -64,7 +67,6 @@ def decrypt_secret(cipher: str) -> str:
         data = f.decrypt(cipher.encode("utf-8"))
         return data.decode("utf-8")
     except InvalidToken:
-        # If key changed, or corrupted, treat as empty but don't crash whole app
         return ""
 
 
@@ -89,13 +91,51 @@ def verify_password(password: str, stored: str) -> bool:
 
 
 # ======================================================
+# Security Q&A hashing (PBKDF2 + PEPPER, irreversible)
+# ======================================================
+def _get_security_pepper() -> str:
+    # IMPORTANT: keep this secret out of DB; set env var in deployment
+    return os.environ.get("APP_SECURITY_PEPPER", "").strip()
+
+
+def _norm_answer(s: str) -> str:
+    return (s or "").strip().lower()
+
+
+def hash_security_answer(answer: str) -> str:
+    """
+    Irreversible hash for security answers:
+    - normalize (strip+lower)
+    - PBKDF2 over (pepper + '\\n' + answer)
+    """
+    a = _norm_answer(answer)
+    if not a:
+        return ""
+    pepper = _get_security_pepper()
+    salt = os.urandom(16)
+    material = (pepper + "\n" + a).encode("utf-8")
+    dk = hashlib.pbkdf2_hmac("sha256", material, salt, 250_000)
+    return base64.b64encode(salt + dk).decode("utf-8")
+
+
+def verify_security_answer(answer: str, stored: str) -> bool:
+    if not stored:
+        return False
+    a = _norm_answer(answer)
+    if not a:
+        return False
+    raw = base64.b64decode(stored.encode("utf-8"))
+    salt, dk = raw[:16], raw[16:]
+    pepper = _get_security_pepper()
+    material = (pepper + "\n" + a).encode("utf-8")
+    dk2 = hashlib.pbkdf2_hmac("sha256", material, salt, 250_000)
+    return hmac.compare_digest(dk, dk2)
+
+
+# ======================================================
 # DB helpers (locking + WAL + busy_timeout)
 # ======================================================
 def db_connect():
-    """
-    One connection per operation; SQLite is file-based; this is okay for Streamlit.
-    WAL + busy_timeout reduces 'database is locked' errors.
-    """
     conn = sqlite3.connect(DB_FILE, timeout=30, check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA synchronous=NORMAL;")
@@ -136,13 +176,6 @@ def db_query_one(sql: str, params=()):
             conn.close()
 
 
-def _table_has_column(table: str, col: str) -> bool:
-    row = db_query_df(f"PRAGMA table_info({table})")
-    if row.empty:
-        return False
-    return col in row["name"].tolist()
-
-
 # ======================================================
 # Init / migrations
 # ======================================================
@@ -162,7 +195,24 @@ def init_db():
                 )
             """)
 
-            # --- articles (global, shared) ---
+            # Add security Q/A + rate-limit columns (best-effort)
+            # NOTE: SQLite doesn't support IF NOT EXISTS in ADD COLUMN.
+            for ddl in [
+                "ALTER TABLE users ADD COLUMN sec_q1 TEXT",
+                "ALTER TABLE users ADD COLUMN sec_a1_hash TEXT",
+                "ALTER TABLE users ADD COLUMN sec_q2 TEXT",
+                "ALTER TABLE users ADD COLUMN sec_a2_hash TEXT",
+                "ALTER TABLE users ADD COLUMN sec_q3 TEXT",
+                "ALTER TABLE users ADD COLUMN sec_a3_hash TEXT",
+                "ALTER TABLE users ADD COLUMN sec_fail_count INTEGER DEFAULT 0",
+                "ALTER TABLE users ADD COLUMN sec_lock_until INTEGER DEFAULT 0"
+            ]:
+                try:
+                    c.execute(ddl)
+                except Exception:
+                    pass
+
+            # --- articles ---
             c.execute("""
                 CREATE TABLE IF NOT EXISTS articles (
                     pmid TEXT PRIMARY KEY,
@@ -185,7 +235,7 @@ def init_db():
                 )
             """)
 
-            # --- search_cache (per user, per session) ---
+            # --- search_cache (per user) ---
             c.execute("""
                 CREATE TABLE IF NOT EXISTS search_cache (
                     user_id TEXT,
@@ -246,7 +296,7 @@ def init_db():
                 )
             """)
 
-            # --- NEW: multi-turn review chat sessions ---
+            # --- multi-turn review chat ---
             c.execute("""
                 CREATE TABLE IF NOT EXISTS review_chat_sessions (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -274,20 +324,17 @@ def init_db():
         finally:
             conn.close()
 
-    # Best-effort migration from old single-user schema (if present)
-    # - If old favorites table had only pmid (PRIMARY KEY), move to new favorites with user_id='default'
-    # - If old search_cache had (idx, pmid), move to new search_cache with user_id='default'
+    # Best-effort migration from old schema
     try:
         migrate_legacy_to_multiuser()
     except Exception:
-        # Never block app start on migration errors
         pass
 
 
 def migrate_legacy_to_multiuser():
     """
     Best-effort migration from legacy single-user schema to multi-user.
-    IMPORTANT: Do NOT early-return just because one table is already migrated.
+    This function is idempotent-ish and best-effort.
     """
     with _DB_LOCK:
         conn = db_connect()
@@ -329,15 +376,12 @@ def migrate_legacy_to_multiuser():
                             FOREIGN KEY (pmid) REFERENCES articles(pmid)
                         )
                     """)
-                    # old schema might be (idx, pmid)
-                    # copy as default user
                     try:
                         c.execute("""
                             INSERT OR IGNORE INTO search_cache(user_id, idx, pmid)
                             SELECT 'default', idx, pmid FROM search_cache_legacy
                         """)
                     except Exception:
-                        # if legacy table doesn't have idx, fall back to rowid ordering
                         c.execute("""
                             INSERT OR IGNORE INTO search_cache(user_id, idx, pmid)
                             SELECT 'default', (rowid-1) as idx, pmid FROM search_cache_legacy
@@ -349,14 +393,11 @@ def migrate_legacy_to_multiuser():
             if c.fetchone():
                 c.execute("PRAGMA table_info(ai_settings)")
                 ai_cols = [r[1] for r in c.fetchall()]
-                # legacy had "id" and "api_key", new has "user_id" and "api_key_enc"
-                if "user_id" not in ai_cols:
-                    row = None
-                    if "id" in ai_cols:
-                        row = conn.execute("""
-                            SELECT base_url, api_key, model, temperature, max_tokens, system_prompt
-                            FROM ai_settings WHERE id=1
-                        """).fetchone()
+                if "user_id" not in ai_cols and "id" in ai_cols:
+                    row = conn.execute("""
+                        SELECT base_url, api_key, model, temperature, max_tokens, system_prompt
+                        FROM ai_settings WHERE id=1
+                    """).fetchone()
 
                     c.execute("ALTER TABLE ai_settings RENAME TO ai_settings_legacy")
                     c.execute("""
@@ -376,15 +417,11 @@ def migrate_legacy_to_multiuser():
                         c.execute("""
                             INSERT OR REPLACE INTO ai_settings(user_id, base_url, api_key_enc, model, temperature, max_tokens, system_prompt)
                             VALUES (?, ?, ?, ?, ?, ?, ?)
-                        """, (
-                            "default",
-                            (base_url or "https://api.openai.com/v1").rstrip("/"),
-                            api_key_enc,
-                            model or "gpt-4o-mini",
-                            float(temperature) if temperature is not None else 0.3,
-                            int(max_tokens) if max_tokens is not None else 1500,
-                            system_prompt or ""
-                        ))
+                        """, ("default", (base_url or "https://api.openai.com/v1").rstrip("/"), api_key_enc,
+                              model or "gpt-4o-mini",
+                              float(temperature) if temperature is not None else 0.3,
+                              int(max_tokens) if max_tokens is not None else 1500,
+                              system_prompt or ""))
                     c.execute("DROP TABLE ai_settings_legacy")
 
             conn.commit()
@@ -424,6 +461,117 @@ def login_user(username: str, password: str) -> str | None:
 def get_username(user_id: str) -> str:
     row = db_query_one("SELECT username FROM users WHERE user_id=?", (user_id,))
     return row[0] if row else "Unknown"
+
+
+def set_security_questions(user_id: str, q1: str, a1: str, q2: str, a2: str, q3: str, a3: str):
+    # reset counters when setting/overwriting
+    db_exec(
+        """
+        UPDATE users
+        SET sec_q1=?, sec_a1_hash=?,
+            sec_q2=?, sec_a2_hash=?,
+            sec_q3=?, sec_a3_hash=?,
+            sec_fail_count=0,
+            sec_lock_until=0
+        WHERE user_id=?
+        """,
+        (
+            (q1 or "").strip(),
+            hash_security_answer(a1),
+            (q2 or "").strip(),
+            hash_security_answer(a2),
+            (q3 or "").strip(),
+            hash_security_answer(a3),
+            user_id,
+        ),
+    )
+
+
+def load_security_questions_by_username(username: str):
+    row = db_query_one(
+        "SELECT user_id, sec_q1, sec_q2, sec_q3 FROM users WHERE username=?",
+        (username.strip(),),
+    )
+    if not row:
+        return None
+    return {"user_id": row[0], "q1": row[1] or "", "q2": row[2] or "", "q3": row[3] or ""}
+
+
+def _get_security_state_by_username(username: str):
+    row = db_query_one(
+        "SELECT user_id, sec_a1_hash, sec_a2_hash, sec_a3_hash, COALESCE(sec_fail_count,0), COALESCE(sec_lock_until,0) "
+        "FROM users WHERE username=?",
+        (username.strip(),),
+    )
+    if not row:
+        return None
+    return {
+        "user_id": row[0],
+        "h1": row[1] or "",
+        "h2": row[2] or "",
+        "h3": row[3] or "",
+        "fail_count": int(row[4] or 0),
+        "lock_until": int(row[5] or 0),
+    }
+
+
+def _set_security_state(user_id: str, fail_count: int, lock_until: int):
+    db_exec(
+        "UPDATE users SET sec_fail_count=?, sec_lock_until=? WHERE user_id=?",
+        (int(fail_count), int(lock_until), user_id),
+    )
+
+
+def verify_security_answers_with_limits(username: str, a1: str, a2: str, a3: str):
+    """
+    Returns tuple (status, user_id, wait_seconds)
+    status in: ok, locked, not_set, bad, no_user
+    """
+    stt = _get_security_state_by_username(username)
+    if not stt:
+        return ("no_user", None, 0)
+
+    uid = stt["user_id"]
+    h1, h2, h3 = stt["h1"], stt["h2"], stt["h3"]
+    fail_count = stt["fail_count"]
+    lock_until = stt["lock_until"]
+    now = int(time.time())
+
+    if lock_until and now < lock_until:
+        return ("locked", None, lock_until - now)
+
+    if not (h1 and h2 and h3):
+        return ("not_set", None, 0)
+
+    ok = (
+        verify_security_answer(a1, h1)
+        and verify_security_answer(a2, h2)
+        and verify_security_answer(a3, h3)
+    )
+
+    if ok:
+        # reset on success
+        _set_security_state(uid, 0, 0)
+        return ("ok", uid, 0)
+
+    # failed: increment and maybe lock
+    fail_count += 1
+    new_lock_until = 0
+    if fail_count >= SEC_MAX_FAILS_STAGE2:
+        new_lock_until = now + SEC_LOCK_SECONDS_STAGE2
+    elif fail_count >= SEC_MAX_FAILS_STAGE1:
+        new_lock_until = now + SEC_LOCK_SECONDS_STAGE1
+
+    _set_security_state(uid, fail_count, new_lock_until)
+    if new_lock_until:
+        return ("locked", None, new_lock_until - now)
+    return ("bad", None, 0)
+
+
+def reset_password(user_id: str, new_password: str):
+    if len(new_password) < 6:
+        raise ValueError("新密码至少 6 位")
+    db_exec("UPDATE users SET password_hash=? WHERE user_id=?", (hash_password(new_password), user_id))
 
 
 # ======================================================
@@ -489,12 +637,10 @@ def clear_search_cache(user_id: str):
             finally:
                 conn.close()
     except sqlite3.OperationalError:
-        # likely "no such column: user_id" due to legacy table
         try:
             migrate_legacy_to_multiuser()
         except Exception:
             pass
-        # retry once
         with _DB_LOCK:
             conn = db_connect()
             try:
@@ -785,10 +931,6 @@ def search_pubmed(query, year_from, year_to, article_type, retmax=20):
 # OpenAI-compatible Chat Completions
 # ======================================================
 def call_chat_completions(base_url, api_key, model, temperature, max_tokens, system_prompt, messages):
-    """
-    messages: list of {"role": "...", "content": "..."}.
-    Will prepend system prompt.
-    """
     base_url = (base_url or "").rstrip("/")
     url = f"{base_url}/chat/completions"
 
@@ -956,7 +1098,7 @@ def load_review_chat_messages(user_id: str, session_id: int, limit: int = 200) -
 
 
 # ======================================================
-# Legacy AI review history (kept)
+# Legacy AI review history
 # ======================================================
 def save_ai_review_to_db(user_id: str, source, pmids, topic_hint, base_url, model, temperature, max_tokens, system_prompt, user_prompt, output):
     db_exec(
@@ -1007,7 +1149,7 @@ def load_ai_review(user_id: str, review_id: int):
 
 
 # ======================================================
-# AI chat logs for PubMed strategy (kept)
+# AI chat logs for PubMed strategy
 # ======================================================
 def save_chat_log(user_id: str, chat_type, base_url, model, temperature, max_tokens, system_prompt, user_input, assistant_output):
     db_exec(
@@ -1095,18 +1237,23 @@ def build_pubmed_strategy_prompts(user_text: str):
 # UI
 # ======================================================
 st.set_page_config(layout="wide")
-st.title("📚 PubMed 文献检索系统（多用户 + 加密 + 多轮 AI）")
+st.title("📚 PubMed 文献检索系统（多用户 + 加密 + 多轮 AI + 密保找回）")
 
 init_db()
 
 # --- Auth UI ---
 with st.sidebar:
     st.header("👤 用户")
+
+    pepper = _get_security_pepper()
+    if not pepper:
+        st.warning("未设置 APP_SECURITY_PEPPER：密保答案仍可用，但抗离线撞库能力会降低。建议设置一个长随机字符串。")
+
     if "user_id" not in st.session_state:
         st.session_state["user_id"] = None
 
     if st.session_state["user_id"] is None:
-        tab_login, tab_register = st.tabs(["登录", "注册"])
+        tab_login, tab_register, tab_forgot = st.tabs(["登录", "注册", "忘记密码"])
 
         with tab_login:
             u = st.text_input("用户名", key="login_u")
@@ -1123,14 +1270,68 @@ with st.sidebar:
         with tab_register:
             u2 = st.text_input("新用户名", key="reg_u")
             p2 = st.text_input("新密码（>=6位）", type="password", key="reg_p")
+
+            st.markdown("### 密保问题（用于找回：答对后可重置密码）")
+            q1 = st.text_input("密保问题1", value="我小学的名字是？", key="reg_q1")
+            a1 = st.text_input("答案1", type="password", key="reg_a1")
+            q2 = st.text_input("密保问题2", value="我最喜欢的城市是？", key="reg_q2")
+            a2 = st.text_input("答案2", type="password", key="reg_a2")
+            q3 = st.text_input("密保问题3", value="我的第一只宠物名字是？", key="reg_q3")
+            a3 = st.text_input("答案3", type="password", key="reg_a3")
+
             if st.button("注册"):
                 try:
                     uid = create_user(u2, p2)
+                    # store Q/A hashes + reset counters
+                    set_security_questions(uid, q1, a1, q2, a2, q3, a3)
                     st.session_state["user_id"] = uid
                     st.success("注册并登录成功")
                     st.rerun()
                 except Exception as e:
                     st.error(str(e))
+
+        with tab_forgot:
+            st.info("说明：系统不保存明文密码（不可逆哈希），无法“查看旧密码”。答对密保后只能重置为新密码。")
+            fu = st.text_input("用户名", key="forgot_u")
+
+            qs = load_security_questions_by_username(fu) if fu.strip() else None
+            if qs:
+                st.write("请回答以下密保问题：")
+                st.markdown(f"- 1) {qs['q1'] or '(未设置)'}")
+                fa1 = st.text_input("答案1", type="password", key="forgot_a1")
+                st.markdown(f"- 2) {qs['q2'] or '(未设置)'}")
+                fa2 = st.text_input("答案2", type="password", key="forgot_a2")
+                st.markdown(f"- 3) {qs['q3'] or '(未设置)'}")
+                fa3 = st.text_input("答案3", type="password", key="forgot_a3")
+
+                newp = st.text_input("设置新密码（>=6位）", type="password", key="forgot_newp")
+                newp2 = st.text_input("确认新密码", type="password", key="forgot_newp2")
+
+                if st.button("✅ 验证并重置密码"):
+                    if newp != newp2:
+                        st.error("两次输入的新密码不一致")
+                    else:
+                        status, uid, wait_s = verify_security_answers_with_limits(fu, fa1, fa2, fa3)
+                        if status == "no_user":
+                            st.error("用户不存在")
+                        elif status == "not_set":
+                            st.error("该用户未设置密保，无法找回")
+                        elif status == "locked":
+                            st.error(f"尝试次数过多，已进入冷却时间，请 {int(wait_s)} 秒后再试。")
+                        elif status == "bad":
+                            st.error("密保答案错误")
+                        elif status == "ok" and uid:
+                            try:
+                                reset_password(uid, newp)
+                                st.success("密码已重置，请返回登录页使用新密码登录。")
+                            except Exception as e:
+                                st.error(str(e))
+                        else:
+                            st.error("验证失败")
+
+            else:
+                if fu.strip():
+                    st.warning("未找到该用户，或未设置密保问题。")
 
         st.stop()
 
@@ -1174,7 +1375,7 @@ def remove_selected(pmid):
         st.session_state["selected_pmids"].remove(pmid)
 
 
-# Navigation (NEW: multi-turn review chat page)
+# Navigation
 page = st.sidebar.radio(
     "📄 页面",
     ["🔍 文献检索", "📌 我的收藏", "🤖 AI 综述生成（单次）", "🧠 AI 综述对话（多轮）", "💬 AI 对话：PubMed检索策略"],
@@ -1389,7 +1590,7 @@ elif page == "📌 我的收藏":
 
 
 # ===============================
-# Page: AI review (single-shot, kept)
+# Page: AI review (single-shot)
 # ===============================
 elif page == "🤖 AI 综述生成（单次）":
     st.subheader("🤖 AI 综述生成（单次输出，保存历史）")
@@ -1411,7 +1612,6 @@ elif page == "🤖 AI 综述生成（单次）":
         pmids.extend(fav_pmids)
         source_tag.append("favorites")
 
-    # unique keep order
     seen = set()
     pmids_unique = []
     for p in pmids:
@@ -1484,52 +1684,20 @@ elif page == "🤖 AI 综述生成（单次）":
                     st.success("生成完成，并已保存到本地数据库（ai_reviews）")
 
                     st.text_area("综述内容（每句句末标注 PMID）", output, height=420)
-                    col_d1, col_d2 = st.columns(2)
-                    with col_d1:
-                        if st.button("⬇ 纯前端下载 TXT"):
-                            trigger_frontend_download("ai_review.txt", "text/plain", output.encode("utf-8-sig"))
-                    with col_d2:
-                        if st.button("⬇ 纯前端下载 MD"):
-                            trigger_frontend_download("ai_review.md", "text/markdown", output.encode("utf-8-sig"))
                 except Exception as e:
                     st.session_state["ai_notice"] = f"AI 调用失败：{e}"
 
     if st.session_state.get("ai_notice"):
         show_dialog("提示", st.session_state["ai_notice"], "ai_notice")
 
-    st.markdown("### 4) 历史综述（来自本地数据库）")
-    hist = list_ai_reviews(user_id, limit=50)
-    if hist.empty:
-        st.write("暂无历史记录。")
-    else:
-        options = hist.apply(lambda r: f"#{r['id']} | {r['created_at']} | {r['source']} | {r['model']} | {r['topic_hint']}", axis=1).tolist()
-        sel = st.selectbox("选择一条历史记录", options, index=0)
-        sel_id = int(sel.split("|")[0].strip().replace("#", ""))
-        item = load_ai_review(user_id, sel_id)
-        if item:
-            with st.expander("查看详情", expanded=True):
-                st.write(f"时间：{item['created_at']}")
-                st.write(f"来源：{item['source']}")
-                st.write(f"文献 PMID：{(item['pmids'] or '')[:200]}{'...' if item.get('pmids') and len(item['pmids'])>200 else ''}")
-                st.write(f"模型：{item['model']} | temp={item['temperature']} | max_tokens={item['max_tokens']}")
-                st.text_area("输出", item["output"] or "", height=320)
-                col_h1, col_h2 = st.columns(2)
-                with col_h1:
-                    if st.button("⬇ 下载该条 TXT"):
-                        trigger_frontend_download(f"ai_review_{sel_id}.txt", "text/plain", (item["output"] or "").encode("utf-8-sig"))
-                with col_h2:
-                    if st.button("⬇ 下载该条 MD"):
-                        trigger_frontend_download(f"ai_review_{sel_id}.md", "text/markdown", (item["output"] or "").encode("utf-8-sig"))
-
 
 # ===============================
-# Page: AI review multi-turn chat (NEW)
+# Page: AI review multi-turn chat
 # ===============================
 elif page == "🧠 AI 综述对话（多轮）":
     st.subheader("🧠 AI 综述对话（多轮）")
     st.caption("基于同一批文献上下文进行连续追问；每句仍需在句末标注 PMID。")
 
-    # Sidebar-ish controls for selecting input
     st.markdown("### 1) 选择对话使用的文献")
     col_s1, col_s2, col_s3 = st.columns([1, 1, 2])
     use_selected = col_s1.checkbox("使用已勾选文献", value=True, key="chat_use_selected")
@@ -1539,13 +1707,10 @@ elif page == "🧠 AI 综述对话（多轮）":
     fav_pmids = load_favorite_pmids(user_id)
 
     pmids = []
-    source_tag = []
     if use_selected:
         pmids.extend(selected_pmids)
-        source_tag.append("selected")
     if use_favorites:
         pmids.extend(fav_pmids)
-        source_tag.append("favorites")
 
     seen = set()
     pmids_unique = []
@@ -1572,37 +1737,32 @@ elif page == "🧠 AI 综述对话（多轮）":
     user_extra = col_new.text_area("首轮写作要求（可选）", value="", height=90, key="chat_user_extra")
 
     if col_new.button("🆕 用当前文献启动新对话", disabled=df_input.empty):
-        if df_input.empty:
-            st.session_state["ai_notice"] = "没有可用输入文献：请先勾选或收藏文献。"
-        else:
-            ctx = build_ai_context(df_input)
-            sid = create_review_chat_session(user_id, pmids_unique, topic_hint, ctx)
-            st.session_state["review_chat_session_id"] = sid
+        ctx = build_ai_context(df_input)
+        sid = create_review_chat_session(user_id, pmids_unique, topic_hint, ctx)
+        st.session_state["review_chat_session_id"] = sid
 
-            # auto send first message to generate initial review
-            cfg = load_ai_settings(user_id)
-            sys_prompt = review_system_prompt(cfg["system_prompt"])
-            first_user_prompt = build_review_first_turn(topic_hint, df_input, user_extra=user_extra)
+        cfg = load_ai_settings(user_id)
+        sys_prompt = review_system_prompt(cfg["system_prompt"])
+        first_user_prompt = build_review_first_turn(topic_hint, df_input, user_extra=user_extra)
 
-            try:
-                with st.spinner("AI 正在生成首轮综述..."):
-                    out = call_chat_completions(
-                        base_url=cfg["base_url"].rstrip("/"),
-                        api_key=cfg["api_key"],
-                        model=cfg["model"],
-                        temperature=cfg["temperature"],
-                        max_tokens=cfg["max_tokens"],
-                        system_prompt=sys_prompt,
-                        messages=[{"role": "user", "content": first_user_prompt}],
-                    )
-                add_review_chat_message(user_id, sid, "user", first_user_prompt)
-                add_review_chat_message(user_id, sid, "assistant", out)
-                st.success("已创建对话并生成首轮综述。")
-                st.rerun()
-            except Exception as e:
-                st.session_state["ai_notice"] = f"AI 调用失败：{e}"
+        try:
+            with st.spinner("AI 正在生成首轮综述..."):
+                out = call_chat_completions(
+                    base_url=cfg["base_url"].rstrip("/"),
+                    api_key=cfg["api_key"],
+                    model=cfg["model"],
+                    temperature=cfg["temperature"],
+                    max_tokens=cfg["max_tokens"],
+                    system_prompt=sys_prompt,
+                    messages=[{"role": "user", "content": first_user_prompt}],
+                )
+            add_review_chat_message(user_id, sid, "user", first_user_prompt)
+            add_review_chat_message(user_id, sid, "assistant", out)
+            st.success("已创建对话并生成首轮综述。")
+            st.rerun()
+        except Exception as e:
+            st.session_state["ai_notice"] = f"AI 调用失败：{e}"
 
-    # history sessions selector
     hist_df = list_review_chat_sessions(user_id, limit=50)
     if not hist_df.empty:
         options = hist_df.apply(
@@ -1626,39 +1786,25 @@ elif page == "🧠 AI 综述对话（多轮）":
             st.warning("该对话不存在或无权限。")
         else:
             st.write(f"当前对话：**#{sid}** | 更新时间：{sess.get('updated_at')}")
-            with st.expander("查看对话元信息", expanded=False):
-                st.write(f"主题提示：{sess.get('topic_hint') or ''}")
-                st.write(f"PMIDs：{sess.get('pmids') or ''}")
-
             messages = load_review_chat_messages(user_id, sid, limit=200)
 
-            # Display chat
             for m in messages:
-                if m["role"] == "user":
-                    st.chat_message("user").write(m["content"])
-                else:
-                    st.chat_message("assistant").write(m["content"])
+                st.chat_message("user" if m["role"] == "user" else "assistant").write(m["content"])
 
-            # Chat input
             user_q = st.chat_input("继续追问（例如：请比较这些研究的局限性；或请提出未来研究方向）")
             if user_q:
                 cfg = load_ai_settings(user_id)
                 sys_prompt = review_system_prompt(cfg["system_prompt"])
 
-                # Build messages: include "context" as a pinned user message at the start (so model always sees doc context)
                 pinned_context = (
                     "以下是本次对话固定使用的文献数据（题目+摘要）。你必须只依据这些信息回答，并继续遵守每句句末 PMID 标注：\n\n"
                     + (sess.get("context") or "")
                 )
 
                 model_messages = [{"role": "user", "content": pinned_context}]
-
-                # include previous turns (trim to avoid token blow-up)
-                # keep last 10 user+assistant pairs
                 trimmed = messages[-20:] if len(messages) > 20 else messages
                 for m in trimmed:
                     model_messages.append({"role": m["role"], "content": m["content"]})
-
                 model_messages.append({"role": "user", "content": user_q})
 
                 try:
@@ -1678,130 +1824,53 @@ elif page == "🧠 AI 综述对话（多轮）":
                 except Exception as e:
                     st.session_state["ai_notice"] = f"AI 调用失败：{e}"
 
-            # Export current conversation
-            col_e1, col_e2, col_e3 = st.columns([1, 1, 2])
-            if col_e1.button("⬇ 导出对话 TXT"):
-                txt = ""
-                for m in messages:
-                    txt += f"[{m['created_at']}] {m['role'].upper()}:\n{m['content']}\n\n"
-                trigger_frontend_download(f"review_chat_{sid}.txt", "text/plain", txt.encode("utf-8-sig"))
-
-            if col_e2.button("🧹 清空并关闭当前对话"):
-                st.session_state["review_chat_session_id"] = None
-                st.rerun()
+    if st.session_state.get("ai_notice"):
+        show_dialog("提示", st.session_state["ai_notice"], "ai_notice")
 
 
 # ===============================
-# Page: PubMed strategy chat (kept)
+# Page: PubMed strategy chat
 # ===============================
 else:
     st.subheader("💬 AI 对话：生成 PubMed 文献检索策略（保存到本地数据库）")
 
-    st.markdown(
-        """
-把你的研究问题/主题描述粘贴到下面（越具体越好：人群、干预/暴露、对照、结局、研究类型等）。  
-点击生成后，AI 会输出：概念拆解 + 可复制的 PubMed 检索式 + 可选限制条件 + 追问问题。
-"""
-    )
-
     user_text = st.text_area("你的描述", height=160, placeholder="例如：我想检索PD-1/PD-L1抑制剂在非小细胞肺癌一线治疗中的疗效与安全性...")
 
-    col_c1, col_c2, col_c3 = st.columns([1, 1, 2])
-    with col_c1:
-        if st.button("🧠 生成检索策略"):
-            if not user_text.strip():
-                st.session_state["ai_notice"] = "请输入一段描述后再生成。"
-            else:
-                cfg = load_ai_settings(user_id)
-                base_url = cfg["base_url"].rstrip("/")
-                api_key = cfg["api_key"]
-                model = cfg["model"]
-                temperature = cfg["temperature"]
-                max_tokens = cfg["max_tokens"]
-                system_prompt_custom = cfg["system_prompt"]
+    if st.button("🧠 生成检索策略"):
+        if not user_text.strip():
+            st.session_state["ai_notice"] = "请输入一段描述后再生成。"
+        else:
+            cfg = load_ai_settings(user_id)
+            sys_default, user_prompt = build_pubmed_strategy_prompts(user_text)
+            system_prompt = sys_default + ("\n\n" + cfg["system_prompt"].strip() if cfg["system_prompt"].strip() else "")
 
-                if not base_url:
-                    st.session_state["ai_notice"] = "Base URL 为空，请先在侧边栏保存接口设置。"
-                elif not model:
-                    st.session_state["ai_notice"] = "Model 为空，请先在侧边栏保存接口设置。"
-                else:
-                    sys_default, user_prompt = build_pubmed_strategy_prompts(user_text)
-                    system_prompt = sys_default + ("\n\n" + system_prompt_custom.strip() if system_prompt_custom.strip() else "")
+            try:
+                with st.spinner("AI 正在生成 PubMed 检索策略..."):
+                    out = call_chat_completions(
+                        base_url=cfg["base_url"].rstrip("/"),
+                        api_key=cfg["api_key"],
+                        model=cfg["model"],
+                        temperature=cfg["temperature"],
+                        max_tokens=cfg["max_tokens"],
+                        system_prompt=system_prompt,
+                        messages=[{"role": "user", "content": user_prompt}],
+                    )
 
-                    try:
-                        with st.spinner("AI 正在生成 PubMed 检索策略..."):
-                            out = call_chat_completions(
-                                base_url=base_url,
-                                api_key=api_key,
-                                model=model,
-                                temperature=temperature,
-                                max_tokens=max_tokens,
-                                system_prompt=system_prompt,
-                                messages=[{"role": "user", "content": user_prompt}],
-                            )
+                save_chat_log(
+                    user_id=user_id,
+                    chat_type="pubmed_strategy",
+                    base_url=cfg["base_url"].rstrip("/"),
+                    model=cfg["model"],
+                    temperature=cfg["temperature"],
+                    max_tokens=cfg["max_tokens"],
+                    system_prompt=system_prompt,
+                    user_input=user_text,
+                    assistant_output=out,
+                )
 
-                        save_chat_log(
-                            user_id=user_id,
-                            chat_type="pubmed_strategy",
-                            base_url=base_url,
-                            model=model,
-                            temperature=temperature,
-                            max_tokens=max_tokens,
-                            system_prompt=system_prompt,
-                            user_input=user_text,
-                            assistant_output=out,
-                        )
-
-                        st.session_state["chat_last_output"] = out
-                        st.success("已生成并保存到本地数据库（ai_chat_logs）")
-                    except Exception as e:
-                        st.session_state["ai_notice"] = f"AI 调用失败：{e}"
-
-    with col_c2:
-        if st.button("🧹 清空当前输出"):
-            st.session_state["chat_last_output"] = ""
-
-    with col_c3:
-        st.caption("提示：可在侧边栏配置 Base URL / Key / Model 等（用户隔离 + Key 加密保存）。")
+                st.text_area("PubMed 检索策略", out, height=420)
+            except Exception as e:
+                st.session_state["ai_notice"] = f"AI 调用失败：{e}"
 
     if st.session_state.get("ai_notice"):
         show_dialog("提示", st.session_state["ai_notice"], "ai_notice")
-
-    st.markdown("### 当前输出")
-    if st.session_state.get("chat_last_output", "").strip():
-        st.text_area("PubMed 检索策略", st.session_state["chat_last_output"], height=420)
-
-        col_d1, col_d2 = st.columns(2)
-        with col_d1:
-            if st.button("⬇ 纯前端下载 TXT"):
-                trigger_frontend_download("pubmed_search_strategy.txt", "text/plain", st.session_state["chat_last_output"].encode("utf-8-sig"))
-        with col_d2:
-            if st.button("⬇ 纯前端下载 MD"):
-                trigger_frontend_download("pubmed_search_strategy.md", "text/markdown", st.session_state["chat_last_output"].encode("utf-8-sig"))
-    else:
-        st.info("暂无输出。输入描述后点击“生成检索策略”。")
-
-    st.markdown("### 历史对话（来自本地数据库）")
-    hist = list_chat_logs(user_id, "pubmed_strategy", limit=50)
-    if hist.empty:
-        st.write("暂无历史记录。")
-    else:
-        options = hist.apply(lambda r: f"#{r['id']} | {r['created_at']} | {r['model']} | {str(r['user_input'])[:40]}", axis=1).tolist()
-        sel = st.selectbox("选择一条历史记录", options, index=0)
-        sel_id = int(sel.split("|")[0].strip().replace("#", ""))
-        item = load_chat_log(user_id, sel_id)
-        if item:
-            with st.expander("查看历史详情", expanded=True):
-                st.write(f"时间：{item['created_at']}")
-                st.write(f"模型：{item['model']} | temp={item['temperature']} | max_tokens={item['max_tokens']}")
-                st.text_area("用户输入", item["user_input"] or "", height=140)
-                st.text_area("AI 输出", item["assistant_output"] or "", height=320)
-
-                col_h1, col_h2 = st.columns(2)
-                with col_h1:
-                    if st.button("⬇ 下载该条 TXT"):
-                        trigger_frontend_download(f"pubmed_strategy_{sel_id}.txt", "text/plain", (item["assistant_output"] or "").encode("utf-8-sig"))
-                with col_h2:
-                    if st.button("⬇ 下载该条 MD"):
-                        trigger_frontend_download(f"pubmed_strategy_{sel_id}.md", "text/markdown", (item["assistant_output"] or "").encode("utf-8-sig"))
-
