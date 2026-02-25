@@ -385,6 +385,22 @@ def load_chat_log(chat_id: int):
         return None
     return df.iloc[0].to_dict()
 
+def clear_ai_reviews():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("DELETE FROM ai_reviews")
+    conn.commit()
+    conn.close()
+
+def clear_chat_logs(chat_type: str = None):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    if chat_type:
+        c.execute("DELETE FROM ai_chat_logs WHERE chat_type = ?", (chat_type,))
+    else:
+        c.execute("DELETE FROM ai_chat_logs")
+    conn.commit()
+    conn.close()
 
 # ===============================
 # 搜索缓存：启动清空（不删除收藏）
@@ -1497,8 +1513,26 @@ elif page == "🤖 AI 综述生成":
                         st.session_state["ai_notice"] = f"AI 改写失败：{e}"
     else:
         st.info("暂无结果。点击上方“开始生成”。")
-
     st.markdown("### 5) 历史综述（来自本地数据库）")
+
+    col_hclr, _ = st.columns([1, 4])
+    if col_hclr.button("🗑 一键清空AI综述历史", key="clear_ai_reviews_btn"):
+        st.session_state["confirm_clear_ai_reviews"] = True
+
+    if st.session_state.get("confirm_clear_ai_reviews"):
+        @st.dialog("确认清空？")
+        def _confirm_clear_reviews():
+            st.warning("将删除所有 AI 综述历史记录（ai_reviews），且不可恢复。")
+            c1, c2 = st.columns(2)
+            if c1.button("确认删除", key="confirm_clear_ai_reviews_yes"):
+                clear_ai_reviews()
+                st.session_state["confirm_clear_ai_reviews"] = False
+                st.rerun()
+            if c2.button("取消", key="confirm_clear_ai_reviews_no"):
+                st.session_state["confirm_clear_ai_reviews"] = False
+                st.rerun()
+        _confirm_clear_reviews()
+
     hist = list_ai_reviews(limit=50)
     if hist.empty:
         st.write("暂无历史记录。")
@@ -1609,8 +1643,26 @@ else:
                 trigger_frontend_download("pubmed_search_strategy.md", "text/markdown", st.session_state["chat_last_output"].encode("utf-8-sig"))
     else:
         st.info("暂无输出。输入描述后点击“生成检索策略”。")
-
     st.markdown("### 历史对话（来自本地数据库）")
+    
+    col_hclr, _ = st.columns([1, 4])
+    if col_hclr.button("🗑 一键清空AI检索策略历史", key="clear_pubmed_strategy_logs_btn"):
+        st.session_state["confirm_clear_pubmed_strategy_logs"] = True
+
+    if st.session_state.get("confirm_clear_pubmed_strategy_logs"):
+        @st.dialog("确认清空？")
+        def _confirm_clear_logs():
+            st.warning("将删除所有“检索策略生成”AI历史记录（ai_chat_logs: pubmed_strategy），且不可恢复。")
+            c1, c2 = st.columns(2)
+            if c1.button("确认删除", key="confirm_clear_pubmed_strategy_logs_yes"):
+                clear_chat_logs("pubmed_strategy")
+                st.session_state["confirm_clear_pubmed_strategy_logs"] = False
+                st.rerun()
+            if c2.button("取消", key="confirm_clear_pubmed_strategy_logs_no"):
+                st.session_state["confirm_clear_pubmed_strategy_logs"] = False
+                st.rerun()
+    _confirm_clear_logs()
+
     hist = list_chat_logs("pubmed_strategy", limit=50)
     if hist.empty:
         st.write("暂无历史记录。")
