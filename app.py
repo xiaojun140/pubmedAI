@@ -734,6 +734,10 @@ def show_dialog(title, msg, state_key_to_clear=None):
 # ===============================
 def call_chat_completions(base_url, api_key, model, temperature, max_tokens, system_prompt, user_prompt):
     base_url = (base_url or "").rstrip("/")
+    if text.endswith("/v1"):
+        base_url = base_url
+    else:
+        base_url = base_url + "/v1"
     url = f"{base_url}/chat/completions"
 
     headers = {"Content-Type": "application/json"}
