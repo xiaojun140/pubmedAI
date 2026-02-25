@@ -55,6 +55,8 @@ def _new_salt_hex():
 
 
 def create_user(username, password, question, answer):
+    username = username.strip()
+    
     if not username or len(username) < 3:
         raise ValueError("用户名至少3个字符")
     if not password or len(password) < 6:
@@ -112,6 +114,7 @@ def get_security_question(username):
 
 
 def reset_password(username, answer, new_password):
+    username = username.strip()
     if len(new_password) < 6:
         raise ValueError("新密码至少6位")
 
@@ -491,4 +494,5 @@ elif page == "📌 我的收藏":
             if col2.button("❌", key=f"del_{row['pmid']}"):
                 remove_favorite(row["pmid"])
                 st.rerun()
+
 
