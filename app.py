@@ -288,6 +288,9 @@ def save_ai_review_to_db(source, pmids, topic_hint, base_url, model, temperature
         user_prompt,
         output
     ))
+
+    new_id = c.lastrowid  # ✅ 取回自增 id（用于追踪改写来源）
+
     # Ensure ai_settings schema is compatible with this app
     try:
         migrate_ai_settings_schema(conn)
@@ -296,6 +299,8 @@ def save_ai_review_to_db(source, pmids, topic_hint, base_url, model, temperature
 
     conn.commit()
     conn.close()
+    return new_id
+
 
 
 def list_ai_reviews(limit=50):
@@ -975,6 +980,48 @@ def build_review_prompts(topic_hint: str, df: pd.DataFrame, user_extra: str = ""
 
     return system_default, user_prompt
 
+def build_review_revision_prompts(
+    instruction: str,
+    original_review: str,
+    df: pd.DataFrame,
+    topic_hint: str = ""
+):
+    context = build_ai_context(df)
+
+    system_default = (
+        "你是一名严谨的医学/生命科学综述写作助手。"
+        "你将收到：1) 原综述 2) 修改指令 3) 文献题目与摘要。"
+        "你必须只依据文献题目与摘要修改原综述，避免臆测。"
+        "输出为中文。"
+        "非常重要：每一句话末尾必须用括号标注 PMID 作为来源，格式严格为 "
+        "(PMID:12345678 IF: NA NA NA) 或 (PMID:123; PMID:456)。"
+        "不要在句中插入 PMID，只能句末标注。"
+        "不得编造新的 PMID；如需新增表述，必须能从给定文献中找到依据并标注相应 PMID。"
+        "不要输出参考文献列表。"
+    )
+
+    topic_value = topic_hint.strip() or "沿用原综述主题"
+
+    user_prompt = f"""
+请按“修改指令”对“原综述”进行改写，输出一份“修改后的完整综述”（不是修改建议、不是对比清单）。
+
+【主题/方向】
+{topic_value}
+
+【修改指令】
+{instruction.strip()}
+
+【原综述】
+{original_review.strip()}
+
+【文献数据（仅允许依据这些内容）】
+{context}
+""".strip()
+
+    return system_default, user_prompt
+
+
+
 
 
 # ===============================
@@ -1038,6 +1085,8 @@ if "fav_export_request" not in st.session_state:
     st.session_state["fav_export_request"] = None
 if "ai_last_output" not in st.session_state:
     st.session_state["ai_last_output"] = ""
+if "ai_last_review_id" not in st.session_state:
+    st.session_state["ai_last_review_id"] = None
 if "ai_notice" not in st.session_state:
     st.session_state["ai_notice"] = None
 if "chat_last_output" not in st.session_state:
@@ -1394,7 +1443,7 @@ elif page == "🤖 AI 综述生成":
                         )
                     st.session_state["ai_last_output"] = output
 
-                    save_ai_review_to_db(
+                    new_id = save_ai_review_to_db(
                         source=",".join(source_tag) if source_tag else "none",
                         pmids=",".join([str(p) for p in pmids_unique]),
                         topic_hint=topic_hint,
@@ -1406,6 +1455,7 @@ elif page == "🤖 AI 综述生成":
                         user_prompt=user_prompt,
                         output=output
                     )
+                    st.session_state["ai_last_review_id"] = new_id  # ✅ 记录本次生成的 review_id
                     st.success("生成完成，并已保存到本地数据库（ai_reviews）")
                 except Exception as e:
                     st.session_state["ai_notice"] = f"AI 调用失败：{e}"
@@ -1425,6 +1475,85 @@ elif page == "🤖 AI 综述生成":
                 trigger_frontend_download("ai_review.md", "text/markdown", st.session_state["ai_last_output"].encode("utf-8-sig"))
     else:
         st.info("暂无结果。点击上方“开始生成”。")
+
+    
+
+    # ===============================
+    # 4.1) 二次口令修改（迭代改写）
+    # ===============================
+    st.markdown("### 4.1) 根据口令修改本次综述（迭代改写）")
+
+    revise_cmd = st.text_area(
+        "修改口令/指令（例如：压缩到600字；增加局限性段；把结构改为IMRAD；突出临床证据；语气更学术等）",
+        value="",
+        height=110,
+        key="review_revision_cmd"
+    )
+
+    if st.button("✍️ 按口令改写综述", key="btn_revision"):
+        if not st.session_state.get("ai_last_output", "").strip():
+            st.session_state["ai_notice"] = "当前没有可改写的综述，请先生成综述。"
+        elif not revise_cmd.strip():
+            st.session_state["ai_notice"] = "请输入修改口令后再改写。"
+        else:
+            cfg = load_ai_settings()
+            base_url = cfg["base_url"].rstrip("/")
+            api_key = cfg["api_key"]
+            model = cfg["model"]
+            temperature = cfg["temperature"]
+            max_tokens = cfg["max_tokens"]
+            system_prompt_custom = cfg["system_prompt"]
+
+            # 关键：用“同一批文献”作为上下文，防止胡改
+            # df_input 在本页面里已计算（load_articles_by_pmids(pmids_unique)）
+            if df_input.empty:
+                st.session_state["ai_notice"] = "输入文献为空，无法进行基于文献的改写。"
+            else:
+                sys_default, user_prompt2 = build_review_revision_prompts(
+                    instruction=revise_cmd,
+                    original_review=st.session_state["ai_last_output"],
+                    df=df_input,
+                    topic_hint=topic_hint
+                )
+                system_prompt2 = sys_default + ("\n\n" + system_prompt_custom.strip() if system_prompt_custom.strip() else "")
+
+                try:
+                    with st.spinner("AI 正在按口令改写综述..."):
+                        revised = call_chat_completions(
+                            base_url=base_url,
+                            api_key=api_key,
+                            model=model,
+                            temperature=temperature,
+                            max_tokens=max_tokens,
+                            system_prompt=system_prompt2,
+                            user_prompt=user_prompt2
+                        )
+
+                    # 更新当前展示内容
+                    st.session_state["ai_last_output"] = revised
+
+                    parent_id = st.session_state.get("ai_last_review_id")
+                    src = f"revision_of:{parent_id}" if parent_id else "revision"
+
+                    # 保存“改写版”到 DB
+                    new_id2 = save_ai_review_to_db(
+                        source=src,
+                        pmids=",".join([str(p) for p in pmids_unique]),
+                        topic_hint=topic_hint,
+                        base_url=base_url,
+                        model=model,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        system_prompt=system_prompt2,
+                        user_prompt=user_prompt2,
+                        output=revised
+                    )
+                    st.session_state["ai_last_review_id"] = new_id2
+
+                    st.success("已按口令改写，并保存为一条新的历史综述记录。")
+                    st.rerun()
+                except Exception as e:
+                    st.session_state["ai_notice"] = f"AI 改写失败：{e}"
 
     st.markdown("### 5) 历史综述（来自本地数据库）")
 
