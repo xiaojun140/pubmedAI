@@ -733,87 +733,32 @@ def show_dialog(title, msg, state_key_to_clear=None):
 # AI：调用（OpenAI-compatible Chat Completions）
 # ===============================
 def call_chat_completions(base_url, api_key, model, temperature, max_tokens, system_prompt, user_prompt):
-    """
-    Call an OpenAI-compatible Chat Completions endpoint.
+    base_url = (base_url or "").rstrip("/")
+    url = f"{base_url}/chat/completions"
 
-    Fixes common issues:
-    - Base URL may or may not include /v1
-    - Some gateways return HTTP 200 with non-JSON (HTML/text). We detect and raise a clear error.
-    - Provides better error messages for debugging.
-    """
-    base_url = (base_url or "").strip().rstrip("/")
-    if not base_url:
-        raise RuntimeError("Base URL 为空，请先在侧边栏填写并保存。")
-    if not api_key:
-        raise RuntimeError("API Key 为空，请先在侧边栏填写并保存。")
-    if not model:
-        raise RuntimeError("Model 为空，请先选择/填写模型。")
-    # Try both {base}/chat/completions and {base}/v1/chat/completions for compatibility
-    if base_url.endswith("/v1"):
-        candidate_urls = [f"{base_url}/chat/completions"]
-    else:
-        candidate_urls = [f"{base_url}/v1/chat/completions"]
-        
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
 
-    headers = {"Content-Type": "application/json",'Accept': 'application/json', "Authorization": f"Bearer {api_key}"}
     payload = {
         "model": model,
         "temperature": float(temperature),
         "max_tokens": int(max_tokens),
         "messages": [
             {"role": "system", "content": system_prompt or ""},
-            {"role": "user", "content": user_prompt},
-        ],
+            {"role": "user", "content": user_prompt}
+        ]
     }
 
-    last_resp = None
-    for url in candidate_urls:
-        try:
-            r = requests.post(url, headers=headers, json=payload, timeout=120)
-        except requests.RequestException as e:
-            last_resp = (url, None, str(e))
-            continue
+    r = requests.post(url, headers=headers, json=payload, timeout=120)
+    if r.status_code != 200:
+        raise RuntimeError(f"接口返回 {r.status_code}: {r.text[:500]}")
+    data = r.json()
+    try:
+        return data["choices"][0]["message"]["content"]
+    except Exception:
+        raise RuntimeError(f"解析返回失败：{data}")
 
-        last_resp = (url, r.status_code, r.text)
-        # If endpoint not found, try next candidate
-        if r.status_code in (404, 405):
-            continue
-
-        # Non-200 => raise with snippet
-        if r.status_code != 200:
-            ct = (r.headers.get("content-type") or "")
-            snippet = (r.text or "")[:800]
-            raise RuntimeError(f"接口返回 {r.status_code}（{ct}）: {snippet}")
-
-        # 200 but empty or non-JSON => raise
-        body = (r.text or "").strip()
-        if not body:
-            raise RuntimeError("接口返回 200 但响应为空（可能是网关/反代错误或被拦截）。请检查 Base URL 是否正确、Key 是否有效。")
-
-        ct = (r.headers.get("content-type") or "").lower()
-        if "application/json" not in ct and "json" not in ct:
-            # Some services mislabel content-type; still try json, but if fails we give clear error
-            try:
-                data = r.json()
-            except Exception:
-                raise RuntimeError(f"接口返回 200 但不是 JSON（content-type={ct}）。响应片段: {body[:800]}")
-        else:
-            try:
-                data = r.json()
-            except Exception:
-                raise RuntimeError(f"接口返回 200 但 JSON 解析失败。响应片段: {body[:800]}")
-        # Extract answer
-        try:
-            return data["choices"][0]["message"]["content"]
-        except Exception:
-            raise RuntimeError(f"解析返回失败：{str(data)[:800]}")
-    # All candidates failed
-    if last_resp:
-        url, status, text = last_resp
-        if status is None:
-            raise RuntimeError(f"请求失败：{text}")
-        raise RuntimeError(f"无法访问接口（最后尝试：{url}，状态码：{status}）。响应片段：{(text or '')[:800]}")
-    raise RuntimeError("无法访问接口：未知错误")
 
 
 # ===============================
@@ -831,10 +776,7 @@ def fetch_available_models(base_url: str, api_key: str) -> list[str]:
         raise RuntimeError("Base URL 为空")
     if not api_key:
         raise RuntimeError("API Key 为空")
-    if base_url.endswith("/v1"):
-        url = f"{base_url}/models"
-    else:
-        url = f"{base_url}/v1/models"
+
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
 
     def _do(url: str):
@@ -1060,7 +1002,7 @@ if "chat_last_output" not in st.session_state:
 
 
 # 页面导航（新增：💬 AI 对话）
-page = st.sidebar.radio("📄 页面", ["💬 PubMed检索策略生成", "🔍 文献检索", "📌 我的收藏", "🤖 AI 综述生成"])
+page = st.sidebar.radio("📄 页面", ["⚙️ API 设置", "🔍 文献检索", "📌 我的收藏", "🤖 AI 综述生成", "💬 AI 对话：PubMed检索策略"])
 
 
 def add_selected(pmid):
@@ -1143,7 +1085,78 @@ with st.sidebar.expander("🤖 AI 接口设置（保存到本地数据库）", e
         st.success("已保存到本地数据库（ai_settings）")
 
 
-if page == "🔍 文献检索":
+# ===============================
+# 页面：API 设置（新增）
+# ===============================
+if page == "⚙️ API 设置":
+    st.subheader("⚙️ API 设置")
+    st.caption("填写 Base URL 与 API Key 后，点击“获取模型”可从接口读取支持的模型，并回填到侧边栏的 Model 输入框。")
+
+    # Use separate keys to avoid collision with sidebar widgets, then sync to sidebar session_state keys
+    base_url = st.text_input("Base URL", value=st.session_state.get("api_base_url", cfg_saved["base_url"]), key="api_base_url_page")
+    api_key = st.text_input("API Key", value=st.session_state.get("api_key", cfg_saved["api_key"]), type="password", key="api_key_page")
+
+    # sync
+    st.session_state["api_base_url"] = base_url
+    st.session_state["api_key"] = api_key
+
+    col1, col2 = st.columns([1, 3])
+    with col1:
+        if st.button("📡 获取模型", key="btn_fetch_models"):
+            try:
+                models = fetch_available_models(base_url.strip(), api_key.strip())
+                st.session_state["model_list_cache"] = models
+                st.session_state["model_selected_tmp"] = models[0]
+                st.session_state["open_model_dialog"] = True
+            except Exception as e:
+                st.error(str(e))
+
+    with col2:
+        st.write("提示：如果你用的是官方 OpenAI，请确保 Base URL 为 `https://api.openai.com/v1`。若你的网关不带 /v1，程序会在 404 时自动尝试补上 /v1。")
+
+    if st.session_state.get("open_model_dialog"):
+        @st.dialog("选择模型")
+        def _pick_model_dialog():
+            models = st.session_state.get("model_list_cache") or []
+            if not models:
+                st.error("模型列表为空，请重新点击“获取模型”。")
+                if st.button("关闭", key="dlg_close_empty"):
+                    st.session_state["open_model_dialog"] = False
+                    st.rerun()
+                return
+
+            choice = st.selectbox("API 支持的模型", models, index=0, key="model_selected_tmp")
+            c1, c2 = st.columns(2)
+            if c1.button("✅ 使用该模型", key="dlg_use_model"):
+                # core: fill the original Model textbox (sidebar uses key 'api_model')
+                st.session_state["api_model"] = choice
+                st.session_state["api_model_page"] = choice
+                st.session_state["open_model_dialog"] = False
+                st.rerun()
+            if c2.button("取消", key="dlg_cancel"):
+                st.session_state["open_model_dialog"] = False
+                st.rerun()
+
+        _pick_model_dialog()
+
+    st.markdown("---")
+    st.markdown("### 当前模型与参数")
+    model_now = st.text_input("Model（会被弹窗回填）", value=st.session_state.get("api_model", cfg_saved["model"]), key="api_model_page")
+    temperature = st.slider("Temperature", 0.0, 1.0, float(st.session_state.get("api_temp", cfg_saved["temperature"])), 0.05, key="api_temp_page")
+    max_tokens = st.slider("Max tokens", 300, 6000, int(st.session_state.get("api_max_tokens", cfg_saved["max_tokens"])), 100, key="api_max_tokens_page")
+    system_prompt = st.text_area("System Prompt（可选，留空使用内置）", value=st.session_state.get("api_sys_prompt", cfg_saved["system_prompt"]), height=110, key="api_sys_prompt_page")
+
+    # sync back to sidebar keys
+    st.session_state["api_model"] = model_now
+    st.session_state["api_temp"] = temperature
+    st.session_state["api_max_tokens"] = max_tokens
+    st.session_state["api_sys_prompt"] = system_prompt
+
+    if st.button("💾 保存 API 设置（写入数据库）", key="api_save_btn_page"):
+        save_ai_settings(base_url, api_key, model_now, temperature, max_tokens, system_prompt)
+        st.success("已保存到本地数据库（ai_settings）")
+
+elif page == "🔍 文献检索":
 
     query = st.text_input("关键词", "cancer immunotherapy")
     retmax = st.slider("返回数量", 1, 200, 20)
@@ -1576,9 +1589,6 @@ else:
                 with col_h2:
                     if st.button("⬇ 下载该条 MD"):
                         trigger_frontend_download(f"pubmed_strategy_{sel_id}.md", "text/markdown", (item["assistant_output"] or "").encode("utf-8-sig"))
-
-
-
 
 
 
