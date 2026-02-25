@@ -726,6 +726,105 @@ def search_pubmed(query, year_from, year_to, article_type, retmax=20):
     return articles
 
 
+
+
+# ===============================
+# PubMed：按 PMID 批量拉取（用于补齐“改写综述”所需文献上下文）
+# ===============================
+def fetch_pubmed_by_pmids(pmids: list[str], timeout: int = 30) -> list[dict]:
+    """Fetch PubMed article metadata by PMID list (title/abstract/journal/year/doi/pmcid)."""
+    pmids = [str(p).strip() for p in (pmids or []) if str(p).strip()]
+    if not pmids:
+        return []
+    base = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/"
+    # PubMed efetch has URL length limits; chunk it
+    out: list[dict] = []
+    chunk_size = 150
+    for i in range(0, len(pmids), chunk_size):
+        chunk = pmids[i:i+chunk_size]
+        fetch = requests.get(
+            base + "efetch.fcgi",
+            params={"db": "pubmed", "id": ",".join(chunk), "retmode": "xml"},
+            timeout=timeout
+        )
+        fetch.raise_for_status()
+        root = ET.fromstring(fetch.content)
+        for article in root.findall(".//PubmedArticle"):
+            out.append({
+                "pmid": article.findtext(".//PMID"),
+                "title": article.findtext(".//ArticleTitle"),
+                "journal": article.findtext(".//Journal/Title"),
+                "year": article.findtext(".//PubDate/Year"),
+                "abstract": " ".join([a.text for a in article.findall(".//AbstractText") if a.text]),
+                "doi": next((a.text for a in article.findall(".//ArticleId") if a.attrib.get("IdType") == "doi"), None),
+                "pmcid": next((a.text for a in article.findall(".//ArticleId") if a.attrib.get("IdType") == "pmc"), None)
+            })
+    return out
+
+
+def _upsert_articles_to_db(articles: list[dict]) -> None:
+    """Insert/Update articles into local DB (articles table)."""
+    if not articles:
+        return
+    conn = sqlite3.connect(DB_FILE)
+    try:
+        c = conn.cursor()
+        for article in articles:
+            pmid = (article or {}).get("pmid")
+            if not pmid:
+                continue
+            year_val = None
+            y = (article or {}).get("year")
+            if y and str(y).isdigit():
+                year_val = int(y)
+
+            c.execute(
+                """
+                INSERT INTO articles (pmid, title, journal, year, abstract, doi, pmcid)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(pmid) DO UPDATE SET
+                    title=excluded.title,
+                    journal=excluded.journal,
+                    year=excluded.year,
+                    abstract=excluded.abstract,
+                    doi=excluded.doi,
+                    pmcid=excluded.pmcid
+                """,
+                (
+                    str(pmid),
+                    (article or {}).get("title"),
+                    (article or {}).get("journal"),
+                    year_val,
+                    (article or {}).get("abstract"),
+                    (article or {}).get("doi"),
+                    (article or {}).get("pmcid"),
+                ),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def ensure_articles_in_db(pmids: list[str]) -> pd.DataFrame:
+    """Ensure the given pmids exist in local DB; if missing, fetch from PubMed and upsert."""
+    pmids = [str(p).strip() for p in (pmids or []) if str(p).strip()]
+    if not pmids:
+        return pd.DataFrame()
+
+    df = load_articles_by_pmids(pmids)
+    have = set(df["pmid"].astype(str).tolist()) if not df.empty and "pmid" in df.columns else set()
+    missing = [p for p in pmids if p not in have]
+
+    if missing:
+        try:
+            fetched = fetch_pubmed_by_pmids(missing)
+            _upsert_articles_to_db(fetched)
+        except Exception:
+            # Best-effort; fall back to existing rows
+            pass
+
+    return load_articles_by_pmids(pmids)
+
 # ===============================
 # 纯前端触发下载（兼容老版本 Streamlit）
 # ===============================
@@ -1516,10 +1615,10 @@ elif page == "🤖 AI 综述生成":
             # df_input 在本页面里已计算（load_articles_by_pmids(pmids_unique)）
             pmids_for_revision = st.session_state.get("ai_last_pmids") or list(pmids_unique)
             topic_for_revision = st.session_state.get("ai_last_topic_hint") or topic_hint
-            df_rev = load_articles_by_pmids(pmids_for_revision) if pmids_for_revision else pd.DataFrame()
+            df_rev = ensure_articles_in_db(pmids_for_revision) if pmids_for_revision else pd.DataFrame()
 
             if df_rev.empty:
-                st.session_state["ai_notice"] = "缺少上一次生成综述对应的文献上下文，无法进行基于文献的改写。"
+                st.session_state["ai_notice"] = "缺少上一次生成综述对应的文献上下文，无法进行基于文献的改写。你上一次生成的综述内容仍在下方“最新生成结果”文本框中。如需继续改写，请先确保这些 PMID 的文献记录已在本地数据库中（可返回检索页重新搜索或重新收藏/勾选）。"
             else:
                 sys_default, user_prompt2 = build_review_revision_prompts(
                     instruction=revise_cmd,
@@ -1550,8 +1649,8 @@ elif page == "🤖 AI 综述生成":
                     # 保存“改写版”到 DB
                     new_id2 = save_ai_review_to_db(
                         source=src,
-                        pmids=",".join([str(p) for p in pmids_unique]),
-                        topic_hint=topic_hint,
+                        pmids=",".join([str(p) for p in pmids_for_revision]),
+                        topic_hint=topic_for_revision,
                         base_url=base_url,
                         model=model,
                         temperature=temperature,
@@ -1562,6 +1661,10 @@ elif page == "🤖 AI 综述生成":
                     )
                     st.session_state["ai_last_review_id"] = new_id2
 
+                    # ✅ 维持“改写上下文”与“检索页已勾选文献”不丢失（便于多次迭代改写）
+                    st.session_state["ai_last_pmids"] = list(pmids_for_revision)
+                    st.session_state["ai_last_topic_hint"] = topic_for_revision
+                    st.session_state["selected_pmids"] = list(pmids_for_revision)
                     st.success("已按口令改写，并保存为一条新的历史综述记录。")
                     st.rerun()
                 except Exception as e:
