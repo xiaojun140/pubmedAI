@@ -733,32 +733,85 @@ def show_dialog(title, msg, state_key_to_clear=None):
 # AI：调用（OpenAI-compatible Chat Completions）
 # ===============================
 def call_chat_completions(base_url, api_key, model, temperature, max_tokens, system_prompt, user_prompt):
-    base_url = (base_url or "").rstrip("/")
-    url = f"{base_url}/chat/completions"
+    """
+    Call an OpenAI-compatible Chat Completions endpoint.
 
-    headers = {"Content-Type": "application/json"}
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
+    Fixes common issues:
+    - Base URL may or may not include /v1
+    - Some gateways return HTTP 200 with non-JSON (HTML/text). We detect and raise a clear error.
+    - Provides better error messages for debugging.
+    """
+    base_url = (base_url or "").strip().rstrip("/")
+    if not base_url:
+        raise RuntimeError("Base URL 为空，请先在侧边栏填写并保存。")
+    if not api_key:
+        raise RuntimeError("API Key 为空，请先在侧边栏填写并保存。")
+    if not model:
+        raise RuntimeError("Model 为空，请先选择/填写模型。")
+    # Try both {base}/chat/completions and {base}/v1/chat/completions for compatibility
+    candidate_urls = [f"{base_url}/chat/completions"]
+    if not base_url.endswith("/v1"):
+        candidate_urls.append(f"{base_url}/v1/chat/completions")
 
+    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
     payload = {
         "model": model,
         "temperature": float(temperature),
         "max_tokens": int(max_tokens),
         "messages": [
             {"role": "system", "content": system_prompt or ""},
-            {"role": "user", "content": user_prompt}
-        ]
+            {"role": "user", "content": user_prompt},
+        ],
     }
 
-    r = requests.post(url, headers=headers, json=payload, timeout=120)
-    if r.status_code != 200:
-        raise RuntimeError(f"接口返回 {r.status_code}: {r.text[:500]}")
-    data = r.json()
-    try:
-        return data["choices"][0]["message"]["content"]
-    except Exception:
-        raise RuntimeError(f"解析返回失败：{data}")
+    last_resp = None
+    for url in candidate_urls:
+        try:
+            r = requests.post(url, headers=headers, json=payload, timeout=120)
+        except requests.RequestException as e:
+            last_resp = (url, None, str(e))
+            continue
 
+        last_resp = (url, r.status_code, r.text)
+        # If endpoint not found, try next candidate
+        if r.status_code in (404, 405):
+            continue
+
+        # Non-200 => raise with snippet
+        if r.status_code != 200:
+            ct = (r.headers.get("content-type") or "")
+            snippet = (r.text or "")[:800]
+            raise RuntimeError(f"接口返回 {r.status_code}（{ct}）: {snippet}")
+
+        # 200 but empty or non-JSON => raise
+        body = (r.text or "").strip()
+        if not body:
+            raise RuntimeError("接口返回 200 但响应为空（可能是网关/反代错误或被拦截）。请检查 Base URL 是否正确、Key 是否有效。")
+
+        ct = (r.headers.get("content-type") or "").lower()
+        if "application/json" not in ct and "json" not in ct:
+            # Some services mislabel content-type; still try json, but if fails we give clear error
+            try:
+                data = r.json()
+            except Exception:
+                raise RuntimeError(f"接口返回 200 但不是 JSON（content-type={ct}）。响应片段: {body[:800]}")
+        else:
+            try:
+                data = r.json()
+            except Exception:
+                raise RuntimeError(f"接口返回 200 但 JSON 解析失败。响应片段: {body[:800]}")
+        # Extract answer
+        try:
+            return data["choices"][0]["message"]["content"]
+        except Exception:
+            raise RuntimeError(f"解析返回失败：{str(data)[:800]}")
+    # All candidates failed
+    if last_resp:
+        url, status, text = last_resp
+        if status is None:
+            raise RuntimeError(f"请求失败：{text}")
+        raise RuntimeError(f"无法访问接口（最后尝试：{url}，状态码：{status}）。响应片段：{(text or '')[:800]}")
+    raise RuntimeError("无法访问接口：未知错误")
 
 
 # ===============================
