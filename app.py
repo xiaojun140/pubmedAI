@@ -753,7 +753,7 @@ def call_chat_completions(base_url, api_key, model, temperature, max_tokens, sys
     if not base_url.endswith("/v1"):
         candidate_urls.append(f"{base_url}/v1/chat/completions")
 
-    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
+    headers = {"Content-Type": "application/json",'Accept': 'application/json', "Authorization": f"Bearer {api_key}"}
     payload = {
         "model": model,
         "temperature": float(temperature),
@@ -1571,6 +1571,7 @@ else:
                 with col_h2:
                     if st.button("⬇ 下载该条 MD"):
                         trigger_frontend_download(f"pubmed_strategy_{sel_id}.md", "text/markdown", (item["assistant_output"] or "").encode("utf-8-sig"))
+
 
 
 
