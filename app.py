@@ -1087,6 +1087,10 @@ if "ai_last_output" not in st.session_state:
     st.session_state["ai_last_output"] = ""
 if "ai_last_review_id" not in st.session_state:
     st.session_state["ai_last_review_id"] = None
+if "ai_last_pmids" not in st.session_state:
+    st.session_state["ai_last_pmids"] = []
+if "ai_last_topic_hint" not in st.session_state:
+    st.session_state["ai_last_topic_hint"] = ""
 if "ai_notice" not in st.session_state:
     st.session_state["ai_notice"] = None
 if "chat_last_output" not in st.session_state:
@@ -1456,6 +1460,10 @@ elif page == "🤖 AI 综述生成":
                         output=output
                     )
                     st.session_state["ai_last_review_id"] = new_id  # ✅ 记录本次生成的 review_id
+                    # ✅ 记录本次生成使用的 PMID/主题，并保持“检索页已勾选文献”不丢失（便于重复生成）
+                    st.session_state["ai_last_pmids"] = list(pmids_unique)
+                    st.session_state["ai_last_topic_hint"] = topic_hint
+                    st.session_state["selected_pmids"] = list(pmids_unique)
                     st.success("生成完成，并已保存到本地数据库（ai_reviews）")
                 except Exception as e:
                     st.session_state["ai_notice"] = f"AI 调用失败：{e}"
@@ -1506,14 +1514,18 @@ elif page == "🤖 AI 综述生成":
 
             # 关键：用“同一批文献”作为上下文，防止胡改
             # df_input 在本页面里已计算（load_articles_by_pmids(pmids_unique)）
-            if df_input.empty:
-                st.session_state["ai_notice"] = "输入文献为空，无法进行基于文献的改写。"
+            pmids_for_revision = st.session_state.get("ai_last_pmids") or list(pmids_unique)
+            topic_for_revision = st.session_state.get("ai_last_topic_hint") or topic_hint
+            df_rev = load_articles_by_pmids(pmids_for_revision) if pmids_for_revision else pd.DataFrame()
+
+            if df_rev.empty:
+                st.session_state["ai_notice"] = "缺少上一次生成综述对应的文献上下文，无法进行基于文献的改写。"
             else:
                 sys_default, user_prompt2 = build_review_revision_prompts(
                     instruction=revise_cmd,
                     original_review=st.session_state["ai_last_output"],
-                    df=df_input,
-                    topic_hint=topic_hint
+                    df=df_rev,
+                    topic_hint=topic_for_revision
                 )
                 system_prompt2 = sys_default + ("\n\n" + system_prompt_custom.strip() if system_prompt_custom.strip() else "")
 
