@@ -91,6 +91,12 @@ def init_db():
         )
     """)
 
+    # Ensure ai_settings schema is compatible with this app
+    try:
+        migrate_ai_settings_schema(conn)
+    except Exception:
+        pass
+
     conn.commit()
     conn.close()
 
@@ -98,56 +104,164 @@ def init_db():
 # ===============================
 # AI 设置：DB 读写
 # ===============================
+
+def _ai_settings_cols(conn) -> list[str]:
+    try:
+        cur = conn.cursor()
+        cur.execute("PRAGMA table_info(ai_settings)")
+        return [r[1] for r in cur.fetchall()]
+    except Exception:
+        return []
+
+
+def migrate_ai_settings_schema(conn):
+    """Make ai_settings compatible with this app (single-row, id=1)."""
+    cur = conn.cursor()
+    cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='ai_settings'")
+    if not cur.fetchone():
+        return
+
+    cols = _ai_settings_cols(conn)
+    # Desired legacy-compatible schema: id=1 + plaintext api_key
+    if "id" in cols and "api_key" in cols:
+        return
+
+    legacy = f"ai_settings_legacy_{int(time.time())}"
+    # Rename old table
+    cur.execute(f"ALTER TABLE ai_settings RENAME TO {legacy}")
+
+    # Recreate table with expected schema
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS ai_settings (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            base_url TEXT,
+            api_key TEXT,
+            model TEXT,
+            temperature REAL,
+            max_tokens INTEGER,
+            system_prompt TEXT
+        )
+    """)
+
+    # Best-effort copy (API key may be unavailable if old schema used api_key_enc)
+    base_expr = "base_url" if "base_url" in cols else "NULL"
+    api_expr  = "api_key" if "api_key" in cols else "''"
+    model_expr = "model" if "model" in cols else "NULL"
+    temp_expr = "temperature" if "temperature" in cols else "0.3"
+    max_expr = "max_tokens" if "max_tokens" in cols else "1500"
+    sys_expr = "system_prompt" if "system_prompt" in cols else "''"
+
+    try:
+        cur.execute(
+            f"""INSERT INTO ai_settings (id, base_url, api_key, model, temperature, max_tokens, system_prompt)
+                SELECT 1, {base_expr}, {api_expr}, {model_expr}, {temp_expr}, {max_expr}, {sys_expr}
+                FROM {legacy}
+                LIMIT 1
+            """
+        )
+    except Exception:
+        # If copy fails, keep defaults; user can re-enter settings
+        pass
+
+
 def load_ai_settings():
     conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("SELECT base_url, api_key, model, temperature, max_tokens, system_prompt FROM ai_settings WHERE id=1")
-    row = c.fetchone()
-    conn.close()
-    if not row:
+    try:
+        # Ensure schema is compatible (handles old DB files)
+        try:
+            migrate_ai_settings_schema(conn)
+        except Exception:
+            pass
+
+        c = conn.cursor()
+        cols = _ai_settings_cols(conn)
+
+        if "id" in cols:
+            # single-row mode
+            if "api_key" in cols:
+                c.execute(
+                    "SELECT base_url, api_key, model, temperature, max_tokens, system_prompt "
+                    "FROM ai_settings WHERE id=1"
+                )
+            else:
+                # legacy encrypted column cannot be read without its decryptor; force re-enter
+                c.execute(
+                    "SELECT base_url, '' as api_key, model, temperature, max_tokens, system_prompt "
+                    "FROM ai_settings WHERE id=1"
+                )
+            row = c.fetchone()
+        else:
+            # Unknown schema: return defaults
+            row = None
+
+        if not row:
+            return {
+                "base_url": "https://api.openai.com/v1",
+                "api_key": "",
+                "model": "gpt-4o-mini",
+                "temperature": 0.3,
+                "max_tokens": 1500,
+                "system_prompt": ""
+            }
+
         return {
-            "base_url": "https://api.openai.com/v1",
-            "api_key": "",
-            "model": "gpt-4o-mini",
-            "temperature": 0.3,
-            "max_tokens": 1500,
-            "system_prompt": ""
+            "base_url": row[0] or "https://api.openai.com/v1",
+            "api_key": row[1] or "",
+            "model": row[2] or "gpt-4o-mini",
+            "temperature": float(row[3]) if row[3] is not None else 0.3,
+            "max_tokens": int(row[4]) if row[4] is not None else 1500,
+            "system_prompt": row[5] or ""
         }
-    return {
-        "base_url": row[0] or "https://api.openai.com/v1",
-        "api_key": row[1] or "",
-        "model": row[2] or "gpt-4o-mini",
-        "temperature": float(row[3]) if row[3] is not None else 0.3,
-        "max_tokens": int(row[4]) if row[4] is not None else 1500,
-        "system_prompt": row[5] or ""
-    }
+    finally:
+        conn.close()
 
 
 def save_ai_settings(base_url, api_key, model, temperature, max_tokens, system_prompt):
     conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    # API Key 不回显：如果留空则保留旧 Key
-    if not (api_key or "").strip():
+    try:
         try:
-            old = load_ai_settings().get("api_key", "")
+            migrate_ai_settings_schema(conn)
         except Exception:
-            old = ""
-        api_key = old
-    c.execute("""
-        INSERT INTO ai_settings (id, base_url, api_key, model, temperature, max_tokens, system_prompt)
-        VALUES (1, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(id) DO UPDATE SET
-            base_url=excluded.base_url,
-            api_key=excluded.api_key,
-            model=excluded.model,
-            temperature=excluded.temperature,
-            max_tokens=excluded.max_tokens,
-            system_prompt=excluded.system_prompt
-    """, (base_url, api_key, model, float(temperature), int(max_tokens), system_prompt))
-    conn.commit()
-    conn.close()
+            pass
 
+        c = conn.cursor()
+        cols = _ai_settings_cols(conn)
 
+        # API Key 不回显：如果留空则保留旧 Key
+        if not (api_key or "").strip():
+            try:
+                old = load_ai_settings().get("api_key", "")
+            except Exception:
+                old = ""
+            api_key = old
+
+        if "id" not in cols:
+            # If schema is still unexpected, re-migrate and re-check
+            migrate_ai_settings_schema(conn)
+            cols = _ai_settings_cols(conn)
+
+        c.execute("""
+            INSERT INTO ai_settings (id, base_url, api_key, model, temperature, max_tokens, system_prompt)
+            VALUES (1, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                base_url=excluded.base_url,
+                api_key=excluded.api_key,
+                model=excluded.model,
+                temperature=excluded.temperature,
+                max_tokens=excluded.max_tokens,
+                system_prompt=excluded.system_prompt
+        """, (
+            (base_url or "").strip().rstrip("/"),
+            (api_key or "").strip(),
+            (model or "").strip(),
+            float(temperature),
+            int(max_tokens),
+            system_prompt or ""
+        ))
+
+        conn.commit()
+    finally:
+        conn.close()
 # ===============================
 # AI 综述：DB 读写
 # ===============================
@@ -174,6 +288,12 @@ def save_ai_review_to_db(source, pmids, topic_hint, base_url, model, temperature
         user_prompt,
         output
     ))
+    # Ensure ai_settings schema is compatible with this app
+    try:
+        migrate_ai_settings_schema(conn)
+    except Exception:
+        pass
+
     conn.commit()
     conn.close()
 
@@ -226,6 +346,12 @@ def save_chat_log(chat_type, base_url, model, temperature, max_tokens, system_pr
         user_input,
         assistant_output
     ))
+    # Ensure ai_settings schema is compatible with this app
+    try:
+        migrate_ai_settings_schema(conn)
+    except Exception:
+        pass
+
     conn.commit()
     conn.close()
 
@@ -270,6 +396,12 @@ def clear_search_cache():
     """)
 
     c.execute("DELETE FROM search_cache")
+    # Ensure ai_settings schema is compatible with this app
+    try:
+        migrate_ai_settings_schema(conn)
+    except Exception:
+        pass
+
     conn.commit()
     conn.close()
 
@@ -319,6 +451,12 @@ def save_search_results_to_db(articles):
             INSERT OR REPLACE INTO search_cache (idx, pmid)
             VALUES (?, ?)
         """, (i, pmid))
+
+    # Ensure ai_settings schema is compatible with this app
+    try:
+        migrate_ai_settings_schema(conn)
+    except Exception:
+        pass
 
     conn.commit()
     conn.close()
@@ -400,6 +538,12 @@ def add_favorite(article):
     ))
 
     c.execute("INSERT OR IGNORE INTO favorites VALUES (?)", (article.get("pmid"),))
+    # Ensure ai_settings schema is compatible with this app
+    try:
+        migrate_ai_settings_schema(conn)
+    except Exception:
+        pass
+
     conn.commit()
     conn.close()
 
@@ -408,6 +552,12 @@ def remove_favorite(pmid):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute("DELETE FROM favorites WHERE pmid = ?", (pmid,))
+    # Ensure ai_settings schema is compatible with this app
+    try:
+        migrate_ai_settings_schema(conn)
+    except Exception:
+        pass
+
     conn.commit()
     conn.close()
 
@@ -416,6 +566,12 @@ def clear_favorites():
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute("DELETE FROM favorites")
+    # Ensure ai_settings schema is compatible with this app
+    try:
+        migrate_ai_settings_schema(conn)
+    except Exception:
+        pass
+
     conn.commit()
     conn.close()
 
