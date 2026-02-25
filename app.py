@@ -749,7 +749,7 @@ def call_chat_completions(base_url, api_key, model, temperature, max_tokens, sys
     if not model:
         raise RuntimeError("Model 为空，请先选择/填写模型。")
     # Try both {base}/chat/completions and {base}/v1/chat/completions for compatibility
-    candidate_urls = [f"{base_url}/chat/completions"]
+    candidate_urls = [f"{base_url}/v1/chat/completions"]
     if not base_url.endswith("/v1"):
         candidate_urls.append(f"{base_url}/v1/chat/completions")
 
@@ -1571,6 +1571,7 @@ else:
                 with col_h2:
                     if st.button("⬇ 下载该条 MD"):
                         trigger_frontend_download(f"pubmed_strategy_{sel_id}.md", "text/markdown", (item["assistant_output"] or "").encode("utf-8-sig"))
+
 
 
 
