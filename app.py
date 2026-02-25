@@ -378,8 +378,8 @@ if not st.session_state["logged_in"]:
     tab1, tab2, tab3 = st.tabs(["登录", "注册", "找回密码"])
 
     with tab1:
-        u = st.text_input("用户名")
-        p = st.text_input("密码", type="password")
+        u = st.text_input("用户名", key="login_user")
+        p = st.text_input("密码", type="password", key="login_pwd")
         if st.button("登录"):
             if verify_login(u, p):
                 after_login(u)
@@ -389,10 +389,10 @@ if not st.session_state["logged_in"]:
                 st.error("用户名或密码错误")
 
     with tab2:
-        ru = st.text_input("新用户名")
-        rp = st.text_input("新密码", type="password")
-        rq = st.text_input("密保问题")
-        ra = st.text_input("密保答案", type="password")
+        ru = st.text_input("新用户名", key="reg_user")
+        rp = st.text_input("新密码", type="password", key="reg_pwd")
+        rq = st.text_input("密保问题", key="reg_q")
+        ra = st.text_input("密保答案", type="password", key="reg_a")
         if st.button("注册"):
             try:
                 create_user(ru, rp, rq, ra)
@@ -401,12 +401,12 @@ if not st.session_state["logged_in"]:
                 st.error(str(e))
 
     with tab3:
-        fu = st.text_input("用户名")
+        fu = st.text_input("用户名", key="fp_user")
         q = get_security_question(fu)
         if q:
             st.info(f"密保问题：{q}")
-            ans = st.text_input("密保答案", type="password")
-            np = st.text_input("新密码", type="password")
+            ans = st.text_input("密保答案", type="password", key="fp_ans")
+            np = st.text_input("新密码", type="password", key="fp_newpwd")
             if st.button("重置密码"):
                 try:
                     reset_password(fu, ans, np)
@@ -491,3 +491,4 @@ elif page == "📌 我的收藏":
             if col2.button("❌", key=f"del_{row['pmid']}"):
                 remove_favorite(row["pmid"])
                 st.rerun()
+
