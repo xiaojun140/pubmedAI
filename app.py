@@ -565,7 +565,7 @@ def load_articles_by_pmids(pmids):
 # 收藏数据库操作
 # ===============================
 def add_favorite(article):
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
     c = conn.cursor()
 
     year_val = None
@@ -593,15 +593,15 @@ def add_favorite(article):
         article.get("pmcid")
     ))
 
-    c.execute("INSERT OR IGNORE INTO favorites VALUES (?)", (article.get("pmid"),))
-    # Ensure ai_settings schema is compatible with this app
-    try:
-        migrate_ai_settings_schema(conn)
-    except Exception:
-        pass
+    # ✅ 关键修改：写明列名
+    c.execute(
+        "INSERT OR IGNORE INTO favorites (pmid) VALUES (?)",
+        (article.get("pmid"),)
+    )
 
     conn.commit()
     conn.close()
+
 
 
 def remove_favorite(pmid):
