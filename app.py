@@ -1282,7 +1282,7 @@ with st.sidebar.expander("🤖 AI 接口设置（保存到本地数据库）", e
 
 if page == "🔍 文献检索":
 
-    query = st.text_input("关键词", "cancer immunotherapy")
+    query = st.text_input("关键词或检索策略", "cancer immunotherapy")
     retmax = st.slider("返回数量", 1, 200, 20)
 
     col_a, col_b, col_c = st.columns(3)
