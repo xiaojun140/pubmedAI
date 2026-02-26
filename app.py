@@ -91,12 +91,8 @@ def init_db():
         )
     """)
 
-    # Ensure ai_settings schema is compatible with this app
-    try:
-        migrate_ai_settings_schema(conn)
-    except Exception:
-        pass
 
+    migrate_ai_settings_schema(conn)
     conn.commit()
     conn.close()
 
@@ -291,11 +287,7 @@ def save_ai_review_to_db(source, pmids, topic_hint, base_url, model, temperature
 
     new_id = c.lastrowid  # ✅ 取回自增 id（用于追踪改写来源）
 
-    # Ensure ai_settings schema is compatible with this app
-    try:
-        migrate_ai_settings_schema(conn)
-    except Exception:
-        pass
+
 
     conn.commit()
     conn.close()
@@ -390,11 +382,7 @@ def save_chat_log(chat_type, base_url, model, temperature, max_tokens, system_pr
         user_input,
         assistant_output
     ))
-    # Ensure ai_settings schema is compatible with this app
-    try:
-        migrate_ai_settings_schema(conn)
-    except Exception:
-        pass
+
 
     conn.commit()
     conn.close()
@@ -440,11 +428,7 @@ def clear_search_cache():
     """)
 
     c.execute("DELETE FROM search_cache")
-    # Ensure ai_settings schema is compatible with this app
-    try:
-        migrate_ai_settings_schema(conn)
-    except Exception:
-        pass
+
 
     conn.commit()
     conn.close()
@@ -496,11 +480,7 @@ def save_search_results_to_db(articles):
             VALUES (?, ?)
         """, (i, pmid))
 
-    # Ensure ai_settings schema is compatible with this app
-    try:
-        migrate_ai_settings_schema(conn)
-    except Exception:
-        pass
+
 
     conn.commit()
     conn.close()
@@ -596,11 +576,7 @@ def remove_favorite(pmid):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute("DELETE FROM favorites WHERE pmid = ?", (pmid,))
-    # Ensure ai_settings schema is compatible with this app
-    try:
-        migrate_ai_settings_schema(conn)
-    except Exception:
-        pass
+
 
     conn.commit()
     conn.close()
@@ -611,10 +587,7 @@ def clear_favorites():
     c = conn.cursor()
     c.execute("DELETE FROM favorites")
     # Ensure ai_settings schema is compatible with this app
-    try:
-        migrate_ai_settings_schema(conn)
-    except Exception:
-        pass
+
 
     conn.commit()
     conn.close()
