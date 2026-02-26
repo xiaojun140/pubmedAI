@@ -421,18 +421,50 @@ def clear_search_cache():
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
 
-    c.execute("""
-        DELETE FROM articles
-        WHERE pmid IN (SELECT pmid FROM search_cache)
-          AND pmid NOT IN (SELECT pmid FROM favorites)
-    """)
+    try:
+        # 确保表存在
+        c.execute("""
+            SELECT name FROM sqlite_master 
+            WHERE type='table' AND name='search_cache'
+        """)
+        if not c.fetchone():
+            conn.close()
+            return
 
-    c.execute("DELETE FROM search_cache")
+        c.execute("""
+            SELECT name FROM sqlite_master 
+            WHERE type='table' AND name='favorites'
+        """)
+        if not c.fetchone():
+            conn.close()
+            return
 
+        c.execute("""
+            SELECT name FROM sqlite_master 
+            WHERE type='table' AND name='articles'
+        """)
+        if not c.fetchone():
+            conn.close()
+            return
 
-    conn.commit()
-    conn.close()
+        # 真正执行删除
+        c.execute("""
+            DELETE FROM articles
+            WHERE pmid IN (SELECT pmid FROM search_cache)
+              AND pmid NOT IN (SELECT pmid FROM favorites)
+        """)
 
+        c.execute("DELETE FROM search_cache")
+
+        conn.commit()
+
+    except Exception:
+        # 避免启动阶段直接炸
+        pass
+    finally:
+        conn.close()
+
+    
 
 def save_search_results_to_db(articles):
     conn = sqlite3.connect(DB_FILE)
