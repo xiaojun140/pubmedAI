@@ -53,7 +53,7 @@ def init_db():
     # JCR 指标表
     c.execute("""
         CREATE TABLE IF NOT EXISTS jcr_metrics (
-            J_name TEXT PRIMARY KEY,
+            j_name TEXT PRIMARY KEY,
             jif REAL,
             jif_quartile TEXT
             )
