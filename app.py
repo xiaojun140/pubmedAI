@@ -765,7 +765,7 @@ def extract_issn(pubmed_article_el: ET.Element) -> str:
 def import_jcr_excel(xlsx_path="2025年最新JCR完整版.xlsx"):
     try:
         df = pd.read_excel(xlsx_path)
-
+        import_jcr_excel
         # 去除列名前后空格
         df.columns = [str(c).strip() for c in df.columns]
 
