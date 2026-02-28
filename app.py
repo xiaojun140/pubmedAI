@@ -53,13 +53,13 @@ def init_db():
     # JCR 指标表
     c.execute("""
         CREATE TABLE IF NOT EXISTS jcr_metrics (
-            issn TEXT PRIMARY KEY,
+            J_name TEXT PRIMARY KEY,
             jif REAL,
             jif_quartile TEXT
             )
     """)
     # 兼容旧数据库：缺列则自动补齐
-    ensure_column(conn, "articles", "issn", "TEXT")
+    ensure_column(conn, "articles", "J_name", "TEXT")
 
     c.execute("""
         CREATE TABLE IF NOT EXISTS favorites (
@@ -765,7 +765,7 @@ def extract_issn(pubmed_article_el: ET.Element) -> str:
 def import_jcr_excel(xlsx_path="2025年最新JCR完整版.xlsx"):
     try:
         df = pd.read_excel(xlsx_path)
-        import_jcr_excel
+        print("JCR表导入中")
         # 去除列名前后空格
         df.columns = [str(c).strip() for c in df.columns]
 
@@ -773,10 +773,10 @@ def import_jcr_excel(xlsx_path="2025年最新JCR完整版.xlsx"):
         c = conn.cursor()
 
         for _, row in df.iterrows():
-            issn = str(row.get("ISSN", "")).strip()
-            if issn == "N/A" or  issn == "":
-                issn = str(row.get("eISSN", "")).strip()
-            if not issn:
+            j_name = str(row.get("Journal Name", "")).strip()
+            if j_name == "N/A" or  j_name == "":
+                j_name = str(row.get("Abbreviated Journal", "")).strip()
+            if not j_name:
                 continue
 
             jif = row.get("JIF")
@@ -789,9 +789,9 @@ def import_jcr_excel(xlsx_path="2025年最新JCR完整版.xlsx"):
 
             c.execute("""
                 INSERT OR REPLACE INTO jcr_metrics
-                (issn, jif, jif_quartile)
+                (j_name, jif, jif_quartile)
                 VALUES (?, ?, ?)
-            """, (issn, jif, quartile))
+            """, (j_name, jif, quartile))
 
         conn.commit()
         conn.close()
@@ -802,16 +802,16 @@ def import_jcr_excel(xlsx_path="2025年最新JCR完整版.xlsx"):
 # ===============================
 # 查询 JCR 指标
 # ===============================
-def get_jcr_metrics(issn):
-    if not issn:
+def get_jcr_metrics(j_name):
+    if not j_name:
         return None, None
 
     conn = sqlite3.connect(DB_FILE)
 
     df = pd.read_sql_query(
-        "SELECT jif, jif_quartile FROM jcr_metrics WHERE issn = ? LIMIT 1",
+        "SELECT jif, jif_quartile FROM jcr_metrics WHERE j_name = ? LIMIT 1",
         conn,
-        params=(issn,)
+        params=(j_name,)
     )
 
     conn.close()
@@ -929,7 +929,7 @@ def _upsert_articles_to_db(articles: list[dict]) -> None:
                     abstract=excluded.abstract,
                     doi=excluded.doi,
                     pmcid=excluded.pmcid,
-                issn=excluded.issn
+                    issn=excluded.issn
                 """,
                 (
                     str(pmid),
@@ -1524,7 +1524,7 @@ if page == "🔍 文献检索":
             else:
                 remove_selected(pmid)
 
-            jif, quartile = get_jcr_metrics(issn)
+            jif, quartile = get_jcr_metrics(journal)
 
             jif_text = f"{jif:.3f}" if jif else "--"
             quartile_text = quartile if quartile else "--"
