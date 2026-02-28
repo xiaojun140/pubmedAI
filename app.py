@@ -762,7 +762,7 @@ def extract_issn(pubmed_article_el: ET.Element) -> str:
 # ===============================
 # 导入 JCR Excel（ISSN匹配）
 # ===============================
-def import_jcr_excel(xlsx_path="JCR.xlsx"):
+def import_jcr_excel(xlsx_path="2025年最新JCR完整版.xlsx"):
     try:
         df = pd.read_excel(xlsx_path)
 
