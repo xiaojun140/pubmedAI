@@ -1531,7 +1531,7 @@ if page == "🔍 文献检索":
 
             st.markdown(
                 f"**期刊:** {journal} | 年份: {year} | ISSN: {issn if issn else '--'} "
-                f"| 📊 JIF 2024: {jif_text} "
+                f"| 📊 IF: {jif_text} "
                 f"| 🏷 JCR分区: {quartile_text}"
             )
             if pmid:
