@@ -50,7 +50,14 @@ def init_db():
             issn TEXT
         )
     """)
-
+    # JCR 指标表
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS jcr_metrics (
+            issn TEXT PRIMARY KEY,
+            jif REAL,
+            jif_quartile TEXT
+            )
+    """)
     # 兼容旧数据库：缺列则自动补齐
     ensure_column(conn, "articles", "issn", "TEXT")
 
@@ -118,6 +125,11 @@ def init_db():
 
 
     migrate_ai_settings_schema(conn)
+
+    try:
+        import_jcr_excel("2025年最新JCR完整版.xlsx")
+    except:
+        pass
     conn.commit()
     conn.close()
 
@@ -745,6 +757,69 @@ def extract_issn(pubmed_article_el: ET.Element) -> str:
             out.append(v)
     return "; ".join(out)
 
+
+
+# ===============================
+# 导入 JCR Excel（ISSN匹配）
+# ===============================
+def import_jcr_excel(xlsx_path="JCR.xlsx"):
+    try:
+        df = pd.read_excel(xlsx_path)
+
+        # 去除列名前后空格
+        df.columns = [str(c).strip() for c in df.columns]
+
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+
+        for _, row in df.iterrows():
+            issn = str(row.get("ISSN", "")).strip()
+            if issn == "N/A" or  issn == "":
+                issn = str(row.get("eISSN", "")).strip()
+            if not issn:
+                continue
+
+            jif = row.get("JIF")
+            quartile = row.get("JIF Quartile")
+
+            try:
+                jif = float(jif)
+            except:
+                jif = None
+
+            c.execute("""
+                INSERT OR REPLACE INTO jcr_metrics
+                (issn, jif, jif_quartile)
+                VALUES (?, ?, ?)
+            """, (issn, jif, quartile))
+
+        conn.commit()
+        conn.close()
+
+    except Exception as e:
+        print("JCR 导入失败:", e)
+
+# ===============================
+# 查询 JCR 指标
+# ===============================
+def get_jcr_metrics(issn):
+    if not issn:
+        return None, None
+
+    conn = sqlite3.connect(DB_FILE)
+
+    df = pd.read_sql_query(
+        "SELECT jif, jif_quartile FROM jcr_metrics WHERE issn = ? LIMIT 1",
+        conn,
+        params=(issn,)
+    )
+
+    conn.close()
+
+    if df.empty:
+        return None, None
+
+    return df.iloc[0]["jif"], df.iloc[0]["jif_quartile"]
 
 # ===============================
 # PubMed 搜索
@@ -1449,8 +1524,16 @@ if page == "🔍 文献检索":
             else:
                 remove_selected(pmid)
 
-            st.markdown(f"**期刊:** {journal} | 年份: {year} | ISSN: {issn if issn else '--'}")
+            jif, quartile = get_jcr_metrics(issn)
 
+            jif_text = f"{jif:.3f}" if jif else "--"
+            quartile_text = quartile if quartile else "--"
+
+            st.markdown(
+                f"**期刊:** {journal} | 年份: {year} | ISSN: {issn if issn else '--'} "
+                f"| 📊 JIF 2024: {jif_text} "
+                f"| 🏷 JCR分区: {quartile_text}"
+            )
             if pmid:
                 st.markdown(f"🆔 PMID: https://pubmed.ncbi.nlm.nih.gov/{pmid}/")
             if pmcid:
