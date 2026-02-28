@@ -11,6 +11,27 @@ DB_FILE = "articles.db"
 
 
 # ===============================
+# DB schema helpers
+# ===============================
+
+def _table_columns(conn, table: str) -> list[str]:
+    cur = conn.cursor()
+    cur.execute(f"PRAGMA table_info({table})")
+    return [r[1] for r in cur.fetchall()]
+
+
+def ensure_column(conn, table: str, col: str, coltype: str) -> None:
+    """Add a column if missing (SQLite). Safe for existing DBs."""
+    try:
+        cols = _table_columns(conn, table)
+        if col not in cols:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {coltype}")
+    except Exception:
+        # Best-effort migration; don't crash app startup
+        pass
+
+
+# ===============================
 # 初始化数据库
 # ===============================
 def init_db():
@@ -29,6 +50,9 @@ def init_db():
             issn TEXT
         )
     """)
+
+    # 兼容旧数据库：缺列则自动补齐
+    ensure_column(conn, "articles", "issn", "TEXT")
 
     c.execute("""
         CREATE TABLE IF NOT EXISTS favorites (
@@ -96,10 +120,7 @@ def init_db():
     migrate_ai_settings_schema(conn)
     conn.commit()
     conn.close()
-    try:
-        c.execute("ALTER TABLE articles ADD COLUMN issn TEXT")
-    except:
-        pass
+
 
 # ===============================
 # AI 设置：DB 读写
@@ -492,15 +513,17 @@ def save_search_results_to_db(articles):
             year_val = int(y)
 
         c.execute("""
-            INSERT INTO articles (pmid, title, journal, year, abstract, doi, pmcid)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO articles (pmid, title, journal, year, abstract, doi, pmcid, issn)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(pmid) DO UPDATE SET
                 title=excluded.title,
                 journal=excluded.journal,
                 year=excluded.year,
                 abstract=excluded.abstract,
                 doi=excluded.doi,
-                pmcid=excluded.pmcid
+                pmcid=excluded.pmcid,
+            issn=excluded.issn,
+                issn=excluded.issn
         """, (
             pmid,
             article.get("title"),
@@ -508,7 +531,8 @@ def save_search_results_to_db(articles):
             year_val,
             article.get("abstract"),
             article.get("doi"),
-            article.get("pmcid")
+            article.get("pmcid"),
+            article.get("issn")
         ))
 
         c.execute("""
@@ -578,15 +602,16 @@ def add_favorite(article):
         year_val = int(y)
 
     c.execute("""
-        INSERT INTO articles (pmid, title, journal, year, abstract, doi, pmcid)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO articles (pmid, title, journal, year, abstract, doi, pmcid, issn)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(pmid) DO UPDATE SET
             title=excluded.title,
             journal=excluded.journal,
             year=excluded.year,
             abstract=excluded.abstract,
             doi=excluded.doi,
-            pmcid=excluded.pmcid
+            pmcid=excluded.pmcid,
+                issn=excluded.issn
     """, (
         article.get("pmid"),
         article.get("title"),
@@ -594,7 +619,8 @@ def add_favorite(article):
         year_val,
         article.get("abstract"),
         article.get("doi"),
-        article.get("pmcid")
+        article.get("pmcid"),
+        article.get("issn")
     ))
 
     # ✅ 关键修改：写明列名
@@ -693,6 +719,34 @@ def highlight_keywords(text, keywords):
 
 
 # ===============================
+# PubMed XML: 提取 ISSN（可能存在多种 ISSN）
+# ===============================
+
+def extract_issn(pubmed_article_el: ET.Element) -> str:
+    """Return ISSN string like '1234-5678; 8765-4321' or '' if missing."""
+    if pubmed_article_el is None:
+        return ""
+    vals = []
+    # Journal/ISSN (may have IssnType)
+    for el in pubmed_article_el.findall(".//Journal/ISSN"):
+        t = (el.text or "").strip()
+        if t:
+            vals.append(t)
+    # ISSNLinking (sometimes present)
+    t2 = (pubmed_article_el.findtext(".//ISSNLinking") or "").strip()
+    if t2:
+        vals.append(t2)
+    # de-dup while preserving order
+    seen = set()
+    out = []
+    for v in vals:
+        if v not in seen:
+            seen.add(v)
+            out.append(v)
+    return "; ".join(out)
+
+
+# ===============================
 # PubMed 搜索
 # ===============================
 def search_pubmed(query, year_from, year_to, article_type, retmax=20):
@@ -731,7 +785,7 @@ def search_pubmed(query, year_from, year_to, article_type, retmax=20):
             "abstract": " ".join([a.text for a in article.findall(".//AbstractText") if a.text]),
             "doi": next((a.text for a in article.findall(".//ArticleId") if a.attrib.get("IdType") == "doi"), None),
             "pmcid": next((a.text for a in article.findall(".//ArticleId") if a.attrib.get("IdType") == "pmc"), None),
-            "issn": article.findtext(".//Journal/ISSN")
+            "issn": extract_issn(article)
         })
     return articles
 
@@ -767,8 +821,9 @@ def fetch_pubmed_by_pmids(pmids: list[str], timeout: int = 30) -> list[dict]:
                 "year": article.findtext(".//PubDate/Year"),
                 "abstract": " ".join([a.text for a in article.findall(".//AbstractText") if a.text]),
                 "doi": next((a.text for a in article.findall(".//ArticleId") if a.attrib.get("IdType") == "doi"), None),
-                "pmcid": next((a.text for a in article.findall(".//ArticleId") if a.attrib.get("IdType") == "pmc"), None)
-            })
+                "pmcid": next((a.text for a in article.findall(".//ArticleId") if a.attrib.get("IdType") == "pmc"), None),
+            "issn": extract_issn(article)
+        })
     return out
 
 
@@ -791,7 +846,7 @@ def _upsert_articles_to_db(articles: list[dict]) -> None:
             c.execute(
                 """
                 INSERT INTO articles (pmid, title, journal, year, abstract, doi, pmcid, issn)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(pmid) DO UPDATE SET
                     title=excluded.title,
                     journal=excluded.journal,
@@ -799,7 +854,7 @@ def _upsert_articles_to_db(articles: list[dict]) -> None:
                     abstract=excluded.abstract,
                     doi=excluded.doi,
                     pmcid=excluded.pmcid,
-                    issn=excluded.issn
+                issn=excluded.issn
                 """,
                 (
                     str(pmid),
@@ -809,7 +864,7 @@ def _upsert_articles_to_db(articles: list[dict]) -> None:
                     (article or {}).get("abstract"),
                     (article or {}).get("doi"),
                     (article or {}).get("pmcid"),
-                    article.get("issn")
+                    (article or {}).get("issn"),
                 ),
             )
         conn.commit()
@@ -1394,9 +1449,7 @@ if page == "🔍 文献检索":
             else:
                 remove_selected(pmid)
 
-            st.markdown(
-                f"**期刊:** {journal} | 年份: {year}"
-                f"| ISSN: {issn if issn else '--'}")
+            st.markdown(f"**期刊:** {journal} | 年份: {year} | ISSN: {issn if issn else '--'}")
 
             if pmid:
                 st.markdown(f"🆔 PMID: https://pubmed.ncbi.nlm.nih.gov/{pmid}/")
@@ -1420,7 +1473,8 @@ if page == "🔍 文献检索":
                     "year": year,
                     "abstract": abstract,
                     "doi": doi,
-                    "pmcid": pmcid
+                    "pmcid": pmcid,
+                    "issn": issn
                 })
                 st.success("已加入收藏")
 
