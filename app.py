@@ -25,7 +25,8 @@ def init_db():
             year INTEGER,
             abstract TEXT,
             doi TEXT,
-            pmcid TEXT
+            pmcid TEXT,
+            issn TEXT
         )
     """)
 
@@ -95,7 +96,10 @@ def init_db():
     migrate_ai_settings_schema(conn)
     conn.commit()
     conn.close()
-
+    try:
+        c.execute("ALTER TABLE articles ADD COLUMN issn TEXT")
+    except:
+        pass
 
 # ===============================
 # AI 设置：DB 读写
@@ -726,7 +730,8 @@ def search_pubmed(query, year_from, year_to, article_type, retmax=20):
             "year": article.findtext(".//PubDate/Year"),
             "abstract": " ".join([a.text for a in article.findall(".//AbstractText") if a.text]),
             "doi": next((a.text for a in article.findall(".//ArticleId") if a.attrib.get("IdType") == "doi"), None),
-            "pmcid": next((a.text for a in article.findall(".//ArticleId") if a.attrib.get("IdType") == "pmc"), None)
+            "pmcid": next((a.text for a in article.findall(".//ArticleId") if a.attrib.get("IdType") == "pmc"), None),
+            "issn": article.findtext(".//Journal/ISSN")
         })
     return articles
 
@@ -785,7 +790,7 @@ def _upsert_articles_to_db(articles: list[dict]) -> None:
 
             c.execute(
                 """
-                INSERT INTO articles (pmid, title, journal, year, abstract, doi, pmcid)
+                INSERT INTO articles (pmid, title, journal, year, abstract, doi, pmcid, issn)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(pmid) DO UPDATE SET
                     title=excluded.title,
@@ -793,7 +798,8 @@ def _upsert_articles_to_db(articles: list[dict]) -> None:
                     year=excluded.year,
                     abstract=excluded.abstract,
                     doi=excluded.doi,
-                    pmcid=excluded.pmcid
+                    pmcid=excluded.pmcid,
+                    issn=excluded.issn
                 """,
                 (
                     str(pmid),
@@ -803,6 +809,7 @@ def _upsert_articles_to_db(articles: list[dict]) -> None:
                     (article or {}).get("abstract"),
                     (article or {}).get("doi"),
                     (article or {}).get("pmcid"),
+                    article.get("issn")
                 ),
             )
         conn.commit()
@@ -1374,6 +1381,7 @@ if page == "🔍 文献检索":
             abstract = row.get("abstract") or ""
             doi = row.get("doi") or ""
             pmcid = row.get("pmcid") or ""
+            issn = row.get("issn") or ""
 
             global_no = start_index + local_i + 1
             checked = st.checkbox(
@@ -1386,7 +1394,9 @@ if page == "🔍 文献检索":
             else:
                 remove_selected(pmid)
 
-            st.markdown(f"**期刊:** {journal} | 年份: {year}")
+            st.markdown(
+                f"**期刊:** {journal} | 年份: {year}"
+                f"| ISSN: {issn if issn else '--'}")
 
             if pmid:
                 st.markdown(f"🆔 PMID: https://pubmed.ncbi.nlm.nih.gov/{pmid}/")
