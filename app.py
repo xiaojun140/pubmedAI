@@ -1528,11 +1528,12 @@ if page == "🔍 文献检索":
 
             jif_text = f"{jif:.3f}" if jif else "--"
             quartile_text = quartile if quartile else "--"
-
+            citation = get_citation_count(pmid)
             st.markdown(
                 f"**期刊:** {journal} | 年份: {year} | ISSN: {issn if issn else '--'} "
                 f"| 📊 IF: {jif_text} "
                 f"| 🏷 JCR分区: {quartile_text}"
+                f"📈 引用次数: {citation if citation is not None else '--'}"
             )
             if pmid:
                 st.markdown(f"🆔 PMID: https://pubmed.ncbi.nlm.nih.gov/{pmid}/")
@@ -1541,8 +1542,6 @@ if page == "🔍 文献检索":
             if doi:
                 st.markdown(f"🔗 DOI: https://doi.org/{doi}")
 
-            citation = get_citation_count(pmid)
-            st.markdown(f"📈 引用次数: {citation if citation is not None else '--'}")
 
             if abstract:
                 with st.expander("📄 查看摘要"):
